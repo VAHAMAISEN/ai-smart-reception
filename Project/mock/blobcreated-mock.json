@@ -1,0 +1,17 @@
+[
+  {
+    "id": "mock-blobcreated-001",
+    "topic": "/subscriptions/mock/resourceGroups/mockRG/providers/Microsoft.Storage/storageAccounts/mockstorage",
+    "subject": "/blobServices/default/containers/recordings/blobs/mock.wav",
+    "eventType": "Microsoft.Storage.BlobCreated",
+    "eventTime": "2026-03-11T05:15:00Z",
+    "dataVersion": "1",
+    "metadataVersion": "1",
+    "data": {
+      "api": "PutBlob",
+      "blobType": "BlockBlob",
+      "contentType": "audio/wav",
+      "url": "https://mock.blob.core.windows.net/recordings/mock.wav"
+    }
+  }
+]

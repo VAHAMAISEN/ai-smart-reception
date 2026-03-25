@@ -1,0 +1,12 @@
+.git
+.github
+.vscode
+node_modules
+Project/node_modules
+Project/dist
+README.md
+CHANGELOG.md
+CONTRIBUTING.md
+LICENSE.md
+SECURITY.md
+package-lock.json

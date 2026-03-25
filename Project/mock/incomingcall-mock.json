@@ -1,0 +1,21 @@
+[
+  {
+    "id": "mock-incomingcall-001",
+    "source": "/subscriptions/mock/resourceGroups/mockRG/providers/Microsoft.Communication/CommunicationServices/mockACS",
+    "type": "Microsoft.Communication.IncomingCall",
+    "time": "2026-03-11T05:00:00Z",
+    "specversion": "1.0",
+    "data": {
+      "from": {
+        "rawId": "4:mock-caller",
+        "kind": "unknown"
+      },
+      "to": {
+        "rawId": "8:acs:mock-resource",
+        "kind": "phoneNumber"
+      },
+      "incomingCallContext": "MOCK_CONTEXT_TOKEN",
+      "serverCallId": "mock-server-call-id"
+    }
+  }
+]
