@@ -26,3 +26,7 @@ yarn-error.log*
 # build dropped
 sdk.bundle.js
 ./config.js
+
+# local secrets
+appsettings.json
+!appsettings.sample.json
