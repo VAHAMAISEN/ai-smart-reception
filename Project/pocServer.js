@@ -396,6 +396,7 @@ const createSession = (event, overrides, employees) => {
         recordingBlobUrl: overrides.recordingBlobUrl || '',
         recordingBlobUrls: overrides.recordingBlobUrls || [],
         recordingId: '',
+        recordingStopRequested: false,
         answerCallResult: null,
         callConnectionId: '',
         callbackUri: '',
@@ -1018,6 +1019,7 @@ const startRecordingForSession = async (config, session) => {
 
         const response = await getCallAutomationClient(config).getCallRecording().start(options);
         session.recordingId = response.recordingId || '';
+        session.recordingStopRequested = false;
         logEvent('recording.started', {
             sessionId: session.id,
             recordingId: session.recordingId
@@ -1027,6 +1029,45 @@ const startRecordingForSession = async (config, session) => {
             sessionId: session.id,
             message: error.message
         });
+    }
+};
+
+const stopRecordingForSession = async (config, session, reason = 'manual-stop') => {
+    if (!session?.recordingId) {
+        logEvent('recording.stop.skipped', {
+            sessionId: session?.id || '',
+            reason: 'recording-id-missing'
+        });
+        return false;
+    }
+
+    if (session.recordingStopRequested) {
+        logEvent('recording.stop.skipped', {
+            sessionId: session.id,
+            recordingId: session.recordingId,
+            reason: 'already-requested'
+        });
+        return false;
+    }
+
+    try {
+        session.recordingStopRequested = true;
+        await getCallAutomationClient(config).getCallRecording().stop(session.recordingId);
+        logEvent('recording.stop.requested', {
+            sessionId: session.id,
+            recordingId: session.recordingId,
+            reason
+        });
+        return true;
+    } catch (error) {
+        session.recordingStopRequested = false;
+        logEvent('recording.stop.failed', {
+            sessionId: session.id,
+            recordingId: session.recordingId,
+            reason,
+            message: error.message
+        });
+        return false;
     }
 };
 
@@ -1128,6 +1169,7 @@ const finalizeMessageFallback = async (config, session, transcript) => {
     });
 
     try {
+        await stopRecordingForSession(config, session, 'message-saved');
         session.pendingAction = {
             type: 'message-complete',
             operationContext: 'message-complete'
@@ -1565,6 +1607,7 @@ const registerPocRoutes = (app, config) => {
                         session.recordingBlobUrl = persistedRecordingUrls[0] || contentLocations[0];
                         session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : contentLocations;
                         session.recordingId = event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || session.recordingId;
+                        session.recordingStopRequested = true;
                         session.updatedAt = new Date().toISOString();
                         logEvent('recording.file-ready', {
                             sessionId: session.id,
@@ -1623,6 +1666,7 @@ const registerPocRoutes = (app, config) => {
                 session.recordingBlobUrl = persistedRecordingUrls[0] || recordingUrls[0];
                 session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : recordingUrls;
                 session.recordingId = getRecordingIdentity(session, selectedEvent, mockOverrides);
+                session.recordingStopRequested = true;
                 session.updatedAt = new Date().toISOString();
             }
 
