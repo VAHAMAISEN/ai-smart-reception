@@ -428,6 +428,17 @@ const buildMessagePayload = (session, overrides = {}) => {
     };
 };
 
+const sanitizeBlobFilePart = (value, fallback = 'unknown') =>
+    String(value || fallback)
+        .replace(/[\\/:*?"<>|]/g, '-')
+        .replace(/\s+/g, '_');
+
+const buildMessageBlobName = (messagePayload) => {
+    const createdAtPart = sanitizeBlobFilePart(String(messagePayload.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
+    const sessionPart = sanitizeBlobFilePart(messagePayload.sessionId, 'no-session');
+    return `${createdAtPart}_${sessionPart}.json`;
+};
+
 const createAiSummaryFallback = (session, transcript) => ({
     summary: `Customer ${session.customerName || 'unknown'} asked for ${session.route.displayName || 'Sato'}. Requirement: ${session.requirement || transcript}`,
     category: transcript.includes('\u898b\u7a4d') ? '\u55b6\u696d' : '\u4e00\u822c',
@@ -984,7 +995,7 @@ const finalizeMessageFallback = async (config, session, transcript) => {
     session.messageBlobUrl = await saveJsonToBlob(
         config,
         MESSAGE_CONTAINER,
-        `${session.serverCallId}.json`,
+        buildMessageBlobName(messagePayload),
         messagePayload
     );
     session.status = 'message-saved';
