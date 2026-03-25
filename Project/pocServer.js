@@ -458,10 +458,21 @@ const buildRecordingBlobName = (session, sourceUrl, index = 0, totalCount = 1) =
 const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targetBlobName) => {
     const blobServiceClient = getStorageClient(config);
     if (!blobServiceClient) {
+        logEvent('blob.copy.skipped', {
+            targetContainerName,
+            targetBlobName,
+            reason: 'storage-client-unavailable'
+        });
         return '';
     }
 
     const { containerName: sourceContainerName, blobName: sourceBlobName } = parseBlobUrl(sourceUrl);
+    logEvent('blob.copy.started', {
+        sourceContainerName,
+        sourceBlobName,
+        targetContainerName,
+        targetBlobName
+    });
     const sourceContainerClient = blobServiceClient.getContainerClient(sourceContainerName);
     const sourceBlobClient = sourceContainerClient.getBlobClient(sourceBlobName);
     const download = await sourceBlobClient.download();
@@ -477,6 +488,13 @@ const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targe
     const targetBlobClient = targetContainerClient.getBlockBlobClient(targetBlobName);
     const body = Buffer.concat(chunks);
     await targetBlobClient.upload(body, body.byteLength);
+    logEvent('blob.copy.completed', {
+        sourceContainerName,
+        sourceBlobName,
+        targetContainerName,
+        targetBlobName,
+        byteLength: body.byteLength
+    });
     return targetBlobClient.url;
 };
 
@@ -490,9 +508,18 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
     for (let index = 0; index < recordingUrls.length; index += 1) {
         const sourceUrl = recordingUrls[index];
         const targetBlobName = buildRecordingBlobName(session, sourceUrl, index, recordingUrls.length);
-        const renamedUrl = await copyBlobToContainer(config, sourceUrl, RECORDING_CONTAINER, targetBlobName);
-        if (renamedUrl) {
-            renamedUrls.push(renamedUrl);
+        try {
+            const renamedUrl = await copyBlobToContainer(config, sourceUrl, RECORDING_CONTAINER, targetBlobName);
+            if (renamedUrl) {
+                renamedUrls.push(renamedUrl);
+            }
+        } catch (error) {
+            logEvent('recording.persist.failed', {
+                sessionId: session.id,
+                sourceUrl,
+                targetBlobName,
+                message: error.message
+            });
         }
     }
 
@@ -504,12 +531,18 @@ const persistAiSummaryForJob = async (config, job) => {
         return '';
     }
 
-    return saveJsonToBlob(
+    const url = await saveJsonToBlob(
         config,
         SUMMARY_CONTAINER,
         buildSummaryBlobName(job),
         job
     );
+    logEvent('summary.persisted', {
+        sessionId: job.sessionId,
+        jobId: job.id,
+        summaryBlobUrl: url
+    });
+    return url;
 };
 
 const createAiSummaryFallback = (session, transcript) => ({
@@ -1522,6 +1555,11 @@ const registerPocRoutes = (app, config) => {
 
                 if (eventType === 'RecordingFileStatusUpdated') {
                     const contentLocations = getRecordingContentLocations(event);
+                    logEvent('recording.status-updated.received', {
+                        sessionId: session.id,
+                        recordingId: event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || '',
+                        recordingChunkCount: contentLocations.length
+                    });
                     if (contentLocations.length > 0) {
                         const persistedRecordingUrls = await persistRecordingsForSession(config, session, contentLocations);
                         session.recordingBlobUrl = persistedRecordingUrls[0] || contentLocations[0];
@@ -1573,6 +1611,12 @@ const registerPocRoutes = (app, config) => {
             const recordingUrls = recordingEvent
                 ? getRecordingContentLocations(recordingEvent)
                 : (blobEvent?.data?.url ? [blobEvent.data.url] : []);
+
+            logEvent('blob-created.received', {
+                sessionId: session?.id || mockOverrides.sessionId || '',
+                eventType: normalizeEventType(selectedEvent),
+                recordingUrlCount: recordingUrls.length
+            });
 
             if (session && recordingUrls.length > 0) {
                 const persistedRecordingUrls = await persistRecordingsForSession(config, session, recordingUrls);
