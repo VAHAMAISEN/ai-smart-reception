@@ -1,3 +1,8 @@
+/**
+ * PoC 検証コンソール（`App.js`）専用のスタイルです。
+ * ダーク基調・パネル型レイアウトで、JSON ブロックやセッションカードを読みやすくしています。
+ */
+
 body {
   margin: 0;
   font-family: "Segoe UI", "Yu Gothic UI", sans-serif;

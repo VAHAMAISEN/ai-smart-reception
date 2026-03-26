@@ -413,6 +413,12 @@ const createSession = (event, overrides, employees) => {
         sessionId,
         serverCallId: session.serverCallId
     });
+    // App Service ログストリーム等での到達確認用（answer 前に必ず1回／セッション単位）。
+    logEvent('poc.experiment', {
+        checkpoint: 'セッションが作成されました',
+        sessionId,
+        serverCallId: session.serverCallId
+    });
     return session;
 };
 
@@ -1189,6 +1195,18 @@ const finalizeMessageFallback = async (config, session, transcript) => {
     }
 };
 
+/**
+ * ACS Call Automation の RecognizeCompleted を処理する。
+ *
+ * 認識テキストが欠落した場合はリトライまたはガイダンスへ戻す。
+ *
+ * @param {object} config サーバー設定
+ * @param {object} session 通話セッション
+ * @param {object} event コールバックイベント
+ * @param {Array<object>} employees 転送先社員一覧
+ * @param {Array<object>} faqs FAQ 一覧
+ * @returns {Promise<void>}
+ */
 const handleRecognizeCompleted = async (config, session, event, employees, faqs) => {
     const operationContext = event?.data?.operationContext || '';
     const recognizedText = extractRecognizedText(event);
