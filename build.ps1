@@ -5,6 +5,14 @@
     カレントディレクトリのDockerfileをACR上でビルドし、
     確認後にApp Serviceへデプロイする。
     Dockerfileと同じ階層にこのファイルを置いて実行する。
+
+    想定読者: エンジニア以外でも「Azure に新しいコンテナ版を載せたい」場合に、
+    対話プロンプトに従えば同じ手順を再現できるようにしています。
+.NOTES
+    前提: Azure CLI (az) が入り、`az login` でサブスクリプションに入れること。
+    変数 $ACR_NAME 等は環境に合わせてスクリプト上部で編集してください。
+    ビルドはクラウド側（ACR の `az acr build`）で行うため、ローカルに Docker が無くても動きます。
+    再起動後のログストリームは一度切れることがあり、切断後は数秒おきに自動再接続します（終了は Ctrl+C）。
 #>
 
 # ============================================
@@ -19,6 +27,11 @@ $RESOURCE_GROUP = "ai-smart-reception"
 $TAG = "fix-$(Get-Date -Format 'yyyyMMdd-HHmm')"
 $FULL_IMAGE = "${IMAGE_NAME}:${TAG}"
 $ACR_IMAGE  = "${ACR_NAME}.azurecr.io/${FULL_IMAGE}"
+
+# 再起動直後に log tail するとストリームがすぐ切れて以降ログが出ないことがあるため、先に待機する。
+$LOG_TAIL_WAIT_AFTER_RESTART_SEC = 30
+# ストリーム終了後、再度 az webapp log tail するまでの待ち（コンテナ起動が遅いと何度か繰り返す）。
+$LOG_TAIL_RECONNECT_DELAY_SEC = 8
 
 # ============================================
 #  事前チェック
@@ -149,8 +162,17 @@ Write-Host ""
 #  Step 5: ログ確認
 # ============================================
 Write-Host "----------------------------------------" -ForegroundColor Cyan
-Write-Host "  Step 5: ログストリーム (Ctrl+C で停止)" -ForegroundColor Cyan
+Write-Host "  Step 5: ログストリーム" -ForegroundColor Cyan
 Write-Host "----------------------------------------" -ForegroundColor Cyan
+Write-Host "  再起動後 ${LOG_TAIL_WAIT_AFTER_RESTART_SEC} 秒待ってから接続します（起動が遅い場合はスクリプト先頭の変数を増やしてください）。" -ForegroundColor Gray
+Write-Host "  切断後は ${LOG_TAIL_RECONNECT_DELAY_SEC} 秒ごとに自動再接続します。終了は Ctrl+C。" -ForegroundColor Gray
 Write-Host ""
 
-az webapp log tail --name $APP_NAME --resource-group $RESOURCE_GROUP
+Start-Sleep -Seconds $LOG_TAIL_WAIT_AFTER_RESTART_SEC
+
+while ($true) {
+    az webapp log tail --name $APP_NAME --resource-group $RESOURCE_GROUP
+    Write-Host ""
+    Write-Host "[情報] ログストリームが終了しました。${LOG_TAIL_RECONNECT_DELAY_SEC} 秒後に再接続します… (終了は Ctrl+C)" -ForegroundColor Yellow
+    Start-Sleep -Seconds $LOG_TAIL_RECONNECT_DELAY_SEC
+}
