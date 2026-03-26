@@ -9,11 +9,12 @@ const EMPLOYEE_CSV_PATH = path.join(__dirname, 'data', 'employees.csv');
 const FAQ_CSV_PATH = path.join(__dirname, 'data', 'faq.csv');
 const MESSAGE_CONTAINER = 'call-messages';
 const RECORDING_CONTAINER = 'call-recordings';
+const SUMMARY_CONTAINER = 'openai-results';
 const TRANSFER_TIMEOUT_MS = 20000;
 const RETRY_PROMPT_LIMIT = 2;
 const PROCESSED_ASYNC_KEY_LIMIT = 500;
 const DEFAULT_TRANSCRIPT = '\u55b6\u696d\u90e8 \u4f50\u85e4\u3055\u3093\u306b\u3064\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002\u7528\u4ef6\u306f\u898b\u7a4d\u306e\u76f8\u8ac7\u3067\u3059\u3002\u6c0f\u540d\u306f\u7530\u4e2d\u3001\u96fb\u8a71\u756a\u53f7\u306f09012345678\u3067\u3059\u3002';
-const GUIDANCE_PROMPT = '\u304a\u3064\u306a\u304e\u5148\u306e\u90e8\u7f72\u540d\u3068\u6c0f\u540d\u3001\u3054\u7528\u4ef6\u3001\u304a\u5ba2\u69d8\u306e\u6c0f\u540d\u3001\u304a\u5ba2\u69d8\u306e\u304a\u96fb\u8a71\u756a\u53f7\u3092\u304a\u805e\u304b\u305b\u304f\u3060\u3055\u3044\u3002';
+const GUIDANCE_PROMPT = '\u304a\u4e16\u8a71\u306b\u306a\u3063\u3066\u304a\u308a\u307e\u3059\u3002\u3054\u7528\u4ef6\u3092\u304a\u8a71\u3057\u304f\u3060\u3055\u3044\u3002';
 const WAITING_PROMPT = '\u8ee2\u9001\u5148\u3092\u78ba\u8a8d\u3057\u3066\u304a\u308a\u307e\u3059\u3002\u305d\u306e\u307e\u307e\u304a\u5f85\u3061\u304f\u3060\u3055\u3044\u3002';
 const ABSENT_PROMPT = '\u62c5\u5f53\u8005\u304c\u5fdc\u7b54\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u4f1d\u8a00\u3092\u304a\u9810\u304b\u308a\u3057\u307e\u3059\u3002\u3054\u7528\u4ef6\u3001\u304a\u540d\u524d\u3001\u304a\u96fb\u8a71\u756a\u53f7\u3092\u304a\u8a71\u3057\u304f\u3060\u3055\u3044\u3002';
 const COMPLETION_PROMPT = '\u78ba\u304b\u306b\u627f\u308a\u307e\u3057\u305f\u3002\u62c5\u5f53\u8005\u306b\u5171\u6709\u3044\u305f\u3057\u307e\u3059\u3002';
@@ -395,6 +396,7 @@ const createSession = (event, overrides, employees) => {
         recordingBlobUrl: overrides.recordingBlobUrl || '',
         recordingBlobUrls: overrides.recordingBlobUrls || [],
         recordingId: '',
+        recordingStopRequested: false,
         answerCallResult: null,
         callConnectionId: '',
         callbackUri: '',
@@ -426,6 +428,122 @@ const buildMessagePayload = (session, overrides = {}) => {
         messageText: transcript,
         createdAt: new Date().toISOString()
     };
+};
+
+const sanitizeBlobFilePart = (value, fallback = 'unknown') =>
+    String(value || fallback)
+        .replace(/[\\/:*?"<>|]/g, '-')
+        .replace(/\s+/g, '_');
+
+const buildMessageBlobName = (messagePayload) => {
+    const createdAtPart = sanitizeBlobFilePart(String(messagePayload.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
+    const sessionPart = sanitizeBlobFilePart(messagePayload.sessionId, 'no-session');
+    return `${createdAtPart}_${sessionPart}.json`;
+};
+
+const buildSummaryBlobName = (job) => {
+    const createdAtPart = sanitizeBlobFilePart(String(job?.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
+    const sessionPart = sanitizeBlobFilePart(job?.sessionId, 'no-session');
+    return `${createdAtPart}_${sessionPart}.json`;
+};
+
+const buildRecordingBlobName = (session, sourceUrl, index = 0, totalCount = 1) => {
+    const createdAtPart = sanitizeBlobFilePart(String(session?.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
+    const sessionPart = sanitizeBlobFilePart(session?.id, 'no-session');
+    const parsed = new URL(sourceUrl);
+    const extension = path.extname(parsed.pathname) || '.wav';
+    const chunkSuffix = totalCount > 1 ? `_part${String(index + 1).padStart(2, '0')}` : '';
+    return `${createdAtPart}_${sessionPart}${chunkSuffix}${extension}`;
+};
+
+const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targetBlobName) => {
+    const blobServiceClient = getStorageClient(config);
+    if (!blobServiceClient) {
+        logEvent('blob.copy.skipped', {
+            targetContainerName,
+            targetBlobName,
+            reason: 'storage-client-unavailable'
+        });
+        return '';
+    }
+
+    const { containerName: sourceContainerName, blobName: sourceBlobName } = parseBlobUrl(sourceUrl);
+    logEvent('blob.copy.started', {
+        sourceContainerName,
+        sourceBlobName,
+        targetContainerName,
+        targetBlobName
+    });
+    const sourceContainerClient = blobServiceClient.getContainerClient(sourceContainerName);
+    const sourceBlobClient = sourceContainerClient.getBlobClient(sourceBlobName);
+    const download = await sourceBlobClient.download();
+    const chunks = [];
+
+    await new Promise((resolve, reject) => {
+        download.readableStreamBody.on('data', (chunk) => chunks.push(chunk));
+        download.readableStreamBody.on('end', resolve);
+        download.readableStreamBody.on('error', reject);
+    });
+
+    const targetContainerClient = await ensureContainer(blobServiceClient, targetContainerName);
+    const targetBlobClient = targetContainerClient.getBlockBlobClient(targetBlobName);
+    const body = Buffer.concat(chunks);
+    await targetBlobClient.upload(body, body.byteLength);
+    logEvent('blob.copy.completed', {
+        sourceContainerName,
+        sourceBlobName,
+        targetContainerName,
+        targetBlobName,
+        byteLength: body.byteLength
+    });
+    return targetBlobClient.url;
+};
+
+const persistRecordingsForSession = async (config, session, recordingUrls) => {
+    if (!session || !Array.isArray(recordingUrls) || recordingUrls.length === 0) {
+        return [];
+    }
+
+    const renamedUrls = [];
+
+    for (let index = 0; index < recordingUrls.length; index += 1) {
+        const sourceUrl = recordingUrls[index];
+        const targetBlobName = buildRecordingBlobName(session, sourceUrl, index, recordingUrls.length);
+        try {
+            const renamedUrl = await copyBlobToContainer(config, sourceUrl, RECORDING_CONTAINER, targetBlobName);
+            if (renamedUrl) {
+                renamedUrls.push(renamedUrl);
+            }
+        } catch (error) {
+            logEvent('recording.persist.failed', {
+                sessionId: session.id,
+                sourceUrl,
+                targetBlobName,
+                message: error.message
+            });
+        }
+    }
+
+    return renamedUrls;
+};
+
+const persistAiSummaryForJob = async (config, job) => {
+    if (!job) {
+        return '';
+    }
+
+    const url = await saveJsonToBlob(
+        config,
+        SUMMARY_CONTAINER,
+        buildSummaryBlobName(job),
+        job
+    );
+    logEvent('summary.persisted', {
+        sessionId: job.sessionId,
+        jobId: job.id,
+        summaryBlobUrl: url
+    });
+    return url;
 };
 
 const createAiSummaryFallback = (session, transcript) => ({
@@ -633,9 +751,19 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
             session.asyncJobIds.push(job.id);
         }
 
+        job.summaryBlobUrl = await persistAiSummaryForJob(config, job);
+
+        if (session) {
+            session.aiSummaryBlobUrl = job.summaryBlobUrl;
+            if (!session.teamsWebhook || session.teamsWebhook.skipped || !session.teamsWebhook.deliveredAt) {
+                session.teamsWebhook = await postTeamsMessage(config, session, buildTeamsMessage(session));
+            }
+        }
+
         logEvent('async-job.completed', {
             jobId: job.id,
-            sessionId: job.sessionId
+            sessionId: job.sessionId,
+            summaryBlobUrl: job.summaryBlobUrl
         });
         return job;
     } catch (error) {
@@ -891,6 +1019,7 @@ const startRecordingForSession = async (config, session) => {
 
         const response = await getCallAutomationClient(config).getCallRecording().start(options);
         session.recordingId = response.recordingId || '';
+        session.recordingStopRequested = false;
         logEvent('recording.started', {
             sessionId: session.id,
             recordingId: session.recordingId
@@ -900,6 +1029,45 @@ const startRecordingForSession = async (config, session) => {
             sessionId: session.id,
             message: error.message
         });
+    }
+};
+
+const stopRecordingForSession = async (config, session, reason = 'manual-stop') => {
+    if (!session?.recordingId) {
+        logEvent('recording.stop.skipped', {
+            sessionId: session?.id || '',
+            reason: 'recording-id-missing'
+        });
+        return false;
+    }
+
+    if (session.recordingStopRequested) {
+        logEvent('recording.stop.skipped', {
+            sessionId: session.id,
+            recordingId: session.recordingId,
+            reason: 'already-requested'
+        });
+        return false;
+    }
+
+    try {
+        session.recordingStopRequested = true;
+        await getCallAutomationClient(config).getCallRecording().stop(session.recordingId);
+        logEvent('recording.stop.requested', {
+            sessionId: session.id,
+            recordingId: session.recordingId,
+            reason
+        });
+        return true;
+    } catch (error) {
+        session.recordingStopRequested = false;
+        logEvent('recording.stop.failed', {
+            sessionId: session.id,
+            recordingId: session.recordingId,
+            reason,
+            message: error.message
+        });
+        return false;
     }
 };
 
@@ -984,12 +1152,16 @@ const finalizeMessageFallback = async (config, session, transcript) => {
     session.messageBlobUrl = await saveJsonToBlob(
         config,
         MESSAGE_CONTAINER,
-        `${session.serverCallId}.json`,
+        buildMessageBlobName(messagePayload),
         messagePayload
     );
     session.status = 'message-saved';
     session.updatedAt = new Date().toISOString();
-    session.teamsWebhook = await postTeamsMessage(config, session, buildTeamsMessage(session));
+    session.teamsWebhook = {
+        skipped: true,
+        reason: 'awaiting-ai-summary',
+        sessionId: session.id
+    };
 
     logEvent('message.saved', {
         sessionId: session.id,
@@ -997,6 +1169,7 @@ const finalizeMessageFallback = async (config, session, transcript) => {
     });
 
     try {
+        await stopRecordingForSession(config, session, 'message-saved');
         session.pendingAction = {
             type: 'message-complete',
             operationContext: 'message-complete'
@@ -1424,10 +1597,17 @@ const registerPocRoutes = (app, config) => {
 
                 if (eventType === 'RecordingFileStatusUpdated') {
                     const contentLocations = getRecordingContentLocations(event);
+                    logEvent('recording.status-updated.received', {
+                        sessionId: session.id,
+                        recordingId: event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || '',
+                        recordingChunkCount: contentLocations.length
+                    });
                     if (contentLocations.length > 0) {
-                        session.recordingBlobUrl = contentLocations[0];
-                        session.recordingBlobUrls = contentLocations;
+                        const persistedRecordingUrls = await persistRecordingsForSession(config, session, contentLocations);
+                        session.recordingBlobUrl = persistedRecordingUrls[0] || contentLocations[0];
+                        session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : contentLocations;
                         session.recordingId = event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || session.recordingId;
+                        session.recordingStopRequested = true;
                         session.updatedAt = new Date().toISOString();
                         logEvent('recording.file-ready', {
                             sessionId: session.id,
@@ -1475,10 +1655,18 @@ const registerPocRoutes = (app, config) => {
                 ? getRecordingContentLocations(recordingEvent)
                 : (blobEvent?.data?.url ? [blobEvent.data.url] : []);
 
+            logEvent('blob-created.received', {
+                sessionId: session?.id || mockOverrides.sessionId || '',
+                eventType: normalizeEventType(selectedEvent),
+                recordingUrlCount: recordingUrls.length
+            });
+
             if (session && recordingUrls.length > 0) {
-                session.recordingBlobUrl = recordingUrls[0];
-                session.recordingBlobUrls = recordingUrls;
+                const persistedRecordingUrls = await persistRecordingsForSession(config, session, recordingUrls);
+                session.recordingBlobUrl = persistedRecordingUrls[0] || recordingUrls[0];
+                session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : recordingUrls;
                 session.recordingId = getRecordingIdentity(session, selectedEvent, mockOverrides);
+                session.recordingStopRequested = true;
                 session.updatedAt = new Date().toISOString();
             }
 
