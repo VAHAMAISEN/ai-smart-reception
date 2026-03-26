@@ -1,2 +1,2 @@
 employee_id,department,display_name,teams_user_id,enabled,priority
-emp-001,\u55b6\u696d\u90e8,\u4f50\u85e4,8:orgid:00000000-0000-0000-0000-000000000000,true,1
+emp-001,営業部,佐藤,8:orgid:00000000-0000-0000-0000-000000000000,true,1
