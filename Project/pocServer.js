@@ -279,8 +279,7 @@ const buildTeamsMessage = (session) => {
     return lines.join('\n');
 };
 
-// 2026-03-23: SDKオブジェクトの循環参照でJSON化に失敗するため、必要最小限の値のみを抽出する形に変更。
-// const identifierToPlainObject = (identifier) => safeJsonParse(JSON.stringify(identifier || {}), {});
+// 2026-03-23: Avoid circular JSON issues from SDK objects by extracting only minimal fields.
 const identifierToPlainObject = (identifier) => {
     if (!identifier || typeof identifier !== 'object') {
         return {};
@@ -296,7 +295,7 @@ const identifierToPlainObject = (identifier) => {
     };
 };
 
-// 2026-03-23: answerCallの戻り値を丸ごと保持すると循環参照を含むため、セッション保持用に安全な最小構造へ変換。
+// 2026-03-23: Avoid circular JSON issues from answerCall results by storing only minimal fields.
 const answerResultToPlainObject = (answerResult) => {
     if (!answerResult || typeof answerResult !== 'object') {
         return {};
@@ -318,13 +317,20 @@ const getStorageAccountNameFromConnectionString = (connectionString) => {
     return match ? match[1] : '';
 };
 
+const getEndpointSuffixFromConnectionString = (connectionString) => {
+    const match = String(connectionString || '').match(/EndpointSuffix=([^;]+)/i);
+    return match ? match[1] : 'core.windows.net';
+};
+
 const deriveRecordingContainerUrl = (config) => {
-    if (config.recordingContainerUrl) {
-        return config.recordingContainerUrl;
+    const configuredUrl = config.recordingContainerUrl || '';
+    if (configuredUrl) {
+        return configuredUrl;
     }
 
     const accountName = getStorageAccountNameFromConnectionString(config.storageConnectionString);
-    return accountName ? `https://${accountName}.blob.core.windows.net/${RECORDING_CONTAINER}` : '';
+    const endpointSuffix = getEndpointSuffixFromConnectionString(config.storageConnectionString);
+    return accountName ? `https://${accountName}.blob.${endpointSuffix}/${RECORDING_CONTAINER}` : '';
 };
 
 const toCallAutomationIdentifier = (identifier) => {
@@ -504,15 +510,18 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
         return [];
     }
 
-    const renamedUrls = [];
+    const persistedArtifacts = [];
 
-    for (let index = 0; index < recordingUrls.length; index += 1) {
-        const sourceUrl = recordingUrls[index];
-        const targetBlobName = buildRecordingBlobName(session, sourceUrl, index, recordingUrls.length);
+    for (const sourceUrl of recordingUrls) {
+        const targetBlobName = buildRecordingBlobName(session, sourceUrl);
         try {
             const renamedUrl = await copyBlobToContainer(config, sourceUrl, RECORDING_CONTAINER, targetBlobName);
             if (renamedUrl) {
-                renamedUrls.push(renamedUrl);
+                persistedArtifacts.push({
+                    sourceUrl,
+                    targetUrl: renamedUrl,
+                    targetBlobName
+                });
             }
         } catch (error) {
             logEvent('recording.persist.failed', {
@@ -524,7 +533,7 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
         }
     }
 
-    return renamedUrls;
+    return persistedArtifacts;
 };
 
 const persistAiSummaryForJob = async (config, job) => {
@@ -618,6 +627,22 @@ const getRecordingContentLocations = (event) => {
     }
     const singleLocation = event?.data?.recordingStorageInfo?.contentLocation || event?.data?.contentLocation || '';
     return singleLocation ? [singleLocation] : [];
+};
+
+const getRecordingArtifactLocations = (event) => {
+    const chunks = event?.data?.recordingStorageInfo?.recordingChunks;
+    if (Array.isArray(chunks) && chunks.length > 0) {
+        return chunks
+            .flatMap((chunk) => [chunk?.contentLocation || '', chunk?.metadataLocation || ''])
+            .filter(Boolean);
+    }
+
+    const urls = [
+        event?.data?.recordingStorageInfo?.contentLocation || event?.data?.contentLocation || '',
+        event?.data?.recordingStorageInfo?.metadataLocation || event?.data?.metadataLocation || ''
+    ].filter(Boolean);
+
+    return urls;
 };
 
 const firstNonEmptyArray = (...candidates) => {
@@ -1008,6 +1033,10 @@ const startRecordingForSession = async (config, session) => {
             recordingFormat: 'wav',
             recordingStateCallbackEndpointUrl: session.callbackUri
         };
+        const callerRecordingIdentifier = toCallAutomationIdentifier(session.from);
+        if (callerRecordingIdentifier) {
+            options.audioChannelParticipantOrdering = [callerRecordingIdentifier];
+        }
 
         const recordingContainerUrl = deriveRecordingContainerUrl(config);
         if (recordingContainerUrl) {
@@ -1022,7 +1051,11 @@ const startRecordingForSession = async (config, session) => {
         session.recordingStopRequested = false;
         logEvent('recording.started', {
             sessionId: session.id,
-            recordingId: session.recordingId
+            recordingId: session.recordingId,
+            recordingChannel: options.recordingChannel,
+            recordingFormat: options.recordingFormat,
+            hasAudioChannelParticipantOrdering: Array.isArray(options.audioChannelParticipantOrdering),
+            audioChannelParticipantOrdering: options.audioChannelParticipantOrdering || []
         });
     } catch (error) {
         logEvent('recording.start-failed', {
@@ -1467,7 +1500,7 @@ const registerPocRoutes = (app, config) => {
                 };
             }
 
-            // 2026-03-23: Cognitive Services 設定が call setup に載っているかを切り分けるための確認ログ。
+            // 2026-03-23: Diagnostic log to confirm Cognitive Services settings are included during call setup.
             logEvent('incoming-call.answer-options', {
                 sessionId: session.id,
                 hasCognitiveServicesEndpoint: Boolean(config.cognitiveServicesEndpoint),
@@ -1477,7 +1510,7 @@ const registerPocRoutes = (app, config) => {
             });
 
             const answerResult = await client.answerCall(session.incomingCallContext, session.callbackUri, answerOptions);
-            // 2026-03-23: answerResult全体のJSON化をやめ、必要最小限の値のみ保存する。
+            // 2026-03-23: Store only a minimal, non-circular answerResult shape in session state.
             session.answerCallResult = answerResultToPlainObject(answerResult);
             session.callConnectionId = session.answerCallResult.callConnectionId || '';
             session.serverCallId = session.answerCallResult.serverCallId || session.serverCallId;
@@ -1516,16 +1549,16 @@ const registerPocRoutes = (app, config) => {
 
                 if (eventType === 'CallConnected') {
                     session.status = 'connected';
-                    // 2026-03-23: Recognize 開始時点での状態を確認するための一時ログ。
+                    // 2026-03-23: Diagnostic log to capture state when recognition flow begins.
                     logEvent('call.connected', {
                         sessionId: session.id,
                         callConnectionId: session.callConnectionId,
                         hasCognitiveServicesEndpoint: Boolean(config.cognitiveServicesEndpoint),
                         cognitiveServicesEndpoint: config.cognitiveServicesEndpoint || ''
                     });
-                    // 2026-03-23: 通話未確立状態での録音開始失敗を避けるため、録音開始は CallConnected 後へ移動。
+                    // 2026-03-23: Start recording only after CallConnected to avoid early-start failures.
                     await startRecordingForSession(config, session);
-                    // 2026-03-23: ガイダンス再生と認識開始を分離し、少なくとも案内は先に流す。
+                    // 2026-03-23: Separate guidance playback from recognize start so the prompt is always played first.
                     session.pendingAction = {
                         type: 'guidance-recognize',
                         operationContext: 'guidance-play'
@@ -1603,7 +1636,12 @@ const registerPocRoutes = (app, config) => {
                         recordingChunkCount: contentLocations.length
                     });
                     if (contentLocations.length > 0) {
-                        const persistedRecordingUrls = await persistRecordingsForSession(config, session, contentLocations);
+                        const artifactLocations = getRecordingArtifactLocations(event);
+                        const persistedArtifacts = await persistRecordingsForSession(config, session, artifactLocations);
+                        const persistedRecordingUrls = contentLocations.map((sourceUrl) => {
+                            const matched = persistedArtifacts.find((item) => item.sourceUrl === sourceUrl);
+                            return matched?.targetUrl || sourceUrl;
+                        });
                         session.recordingBlobUrl = persistedRecordingUrls[0] || contentLocations[0];
                         session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : contentLocations;
                         session.recordingId = event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || session.recordingId;
@@ -1612,7 +1650,9 @@ const registerPocRoutes = (app, config) => {
                         logEvent('recording.file-ready', {
                             sessionId: session.id,
                             recordingBlobUrl: session.recordingBlobUrl,
-                            recordingChunkCount: contentLocations.length
+                            recordingChunkCount: contentLocations.length,
+                            artifactCount: artifactLocations.length,
+                            recordingFolderPrefix: buildRecordingFolderPrefix(session)
                         });
                     }
                     continue;
@@ -1662,12 +1702,23 @@ const registerPocRoutes = (app, config) => {
             });
 
             if (session && recordingUrls.length > 0) {
-                const persistedRecordingUrls = await persistRecordingsForSession(config, session, recordingUrls);
+                const artifactLocations = getRecordingArtifactLocations(selectedEvent);
+                const persistedArtifacts = await persistRecordingsForSession(config, session, artifactLocations);
+                const persistedRecordingUrls = recordingUrls.map((sourceUrl) => {
+                    const matched = persistedArtifacts.find((item) => item.sourceUrl === sourceUrl);
+                    return matched?.targetUrl || sourceUrl;
+                });
                 session.recordingBlobUrl = persistedRecordingUrls[0] || recordingUrls[0];
                 session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : recordingUrls;
                 session.recordingId = getRecordingIdentity(session, selectedEvent, mockOverrides);
                 session.recordingStopRequested = true;
                 session.updatedAt = new Date().toISOString();
+                logEvent('blob-created.persisted', {
+                    sessionId: session.id,
+                    recordingBlobUrl: session.recordingBlobUrl,
+                    artifactCount: artifactLocations.length,
+                    recordingFolderPrefix: buildRecordingFolderPrefix(session)
+                });
             }
 
             const job = await createAsyncJob(config, session, selectedEvent, {
@@ -1689,3 +1740,4 @@ const registerPocRoutes = (app, config) => {
 module.exports = {
     registerPocRoutes
 };
+
