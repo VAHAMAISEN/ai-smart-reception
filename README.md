@@ -71,13 +71,15 @@ Open `http://localhost:5000`.
 
 ## Example mock requests
 
+<!-- TODO: 以下の JSON 例に含まれる日本語はデモ用ハードコード。アプリ設定等へ集約予定。 -->
+
 Incoming call:
 
 ```powershell
 Invoke-RestMethod -Method Post `
   -Uri http://localhost:5000/api/poc/mockIncomingCall `
   -ContentType 'application/json' `
-  -Body '{"recognizedText":"\u55b6\u696d\u90e8 \u4f50\u85e4\u3055\u3093\u306b\u3064\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002\u7528\u4ef6\u306f\u898b\u7a4d\u306e\u76f8\u8ac7\u3067\u3059\u3002\u6c0f\u540d\u306f\u7530\u4e2d\u3001\u96fb\u8a71\u756a\u53f7\u306f09012345678\u3067\u3059\u3002","phoneNumber":"+819012345678","transferOutcome":"timeout"}'
+  -Body '{"recognizedText":"営業部 佐藤さんにつないでください。用件は見積の相談です。氏名は田中、電話番号は09012345678です。","phoneNumber":"+819012345678","transferOutcome":"timeout"}'
 ```
 
 FAQ answer only:
@@ -86,7 +88,7 @@ FAQ answer only:
 Invoke-RestMethod -Method Post `
   -Uri http://localhost:5000/api/poc/mockIncomingCall `
   -ContentType 'application/json' `
-  -Body '{"recognizedText":"\u8cde\u5473\u671f\u9650\u3092\u6559\u3048\u3066\u304f\u3060\u3055\u3044","phoneNumber":"+819012345678"}'
+  -Body '{"recognizedText":"賞味期限を教えてください","phoneNumber":"+819012345678"}'
 ```
 
 Async post-processing:
@@ -95,7 +97,7 @@ Async post-processing:
 Invoke-RestMethod -Method Post `
   -Uri http://localhost:5000/api/poc/mockBlobCreated `
   -ContentType 'application/json' `
-  -Body '{"sessionId":"<session-id>","transcript":"\u4f50\u85e4\u3055\u3093\u306f\u4e0d\u5728\u3067\u3057\u305f\u3002\u898b\u7a4d\u306e\u4ef6\u3067\u6298\u308a\u8fd4\u3057\u304a\u9858\u3044\u3057\u307e\u3059\u3002\u6c0f\u540d\u306f\u7530\u4e2d\u3001\u96fb\u8a71\u756a\u53f7\u306f09012345678\u3067\u3059\u3002"}'
+  -Body '{"sessionId":"<session-id>","transcript":"佐藤さんは不在でした。見積の件で折り返しお願いします。氏名は田中、電話番号は09012345678です。"}'
 ```
 
 ## Cloud Shell container deployment

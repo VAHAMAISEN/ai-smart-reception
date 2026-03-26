@@ -40,16 +40,21 @@ const TRANSFER_TIMEOUT_MS = 20000;
 const RETRY_PROMPT_LIMIT = 2;
 /** 録音イベントの二重処理防止用キーを、メモリに何件まで覚えておくかの上限。 */
 const PROCESSED_ASYNC_KEY_LIMIT = 500;
+// ---------------------------------------------------------------------------
+// TODO: 以下の音声案内・モック用発話などはハードコード。将来は appsettings 等へ集約。
+// ---------------------------------------------------------------------------
 /** テストやフォールバック用の「例の発話」全文（認識が空のときの代替など）。 */
-const DEFAULT_TRANSCRIPT = '\u55b6\u696d\u90e8 \u4f50\u85e4\u3055\u3093\u306b\u3064\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002\u7528\u4ef6\u306f\u898b\u7a4d\u306e\u76f8\u8ac7\u3067\u3059\u3002\u6c0f\u540d\u306f\u7530\u4e2d\u3001\u96fb\u8a71\u756a\u53f7\u306f09012345678\u3067\u3059\u3002';
+const DEFAULT_TRANSCRIPT =
+    '営業部 佐藤さんにつないでください。用件は見積の相談です。氏名は田中、電話番号は09012345678です。';
 /** 通話開始直後に流す「用件を話してください」系の案内文。 */
-const GUIDANCE_PROMPT = '\u304a\u4e16\u8a71\u306b\u306a\u3063\u3066\u304a\u308a\u307e\u3059\u3002\u3054\u7528\u4ef6\u3092\u304a\u8a71\u3057\u304f\u3060\u3055\u3044\u3002';
+const GUIDANCE_PROMPT = 'お世話になっております。ご用件をお話しください。';
 /** 担当者へ転送を試みる直前に流す「お待ちください」系の案内。 */
-const WAITING_PROMPT = '\u8ee2\u9001\u5148\u3092\u78ba\u8a8d\u3057\u3066\u304a\u308a\u307e\u3059\u3002\u305d\u306e\u307e\u307e\u304a\u5f85\u3061\u304f\u3060\u3055\u3044\u3002';
+const WAITING_PROMPT = '転送先を確認しております。そのままお待ちください。';
 /** 担当者不在・転送失敗時に伝言を録音させるためのプロンプト。 */
-const ABSENT_PROMPT = '\u62c5\u5f53\u8005\u304c\u5fdc\u7b54\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u4f1d\u8a00\u3092\u304a\u9810\u304b\u308a\u3057\u307e\u3059\u3002\u3054\u7528\u4ef6\u3001\u304a\u540d\u524d\u3001\u304a\u96fb\u8a71\u756a\u53f7\u3092\u304a\u8a71\u3057\u304f\u3060\u3055\u3044\u3002';
+const ABSENT_PROMPT =
+    '担当者が応答できないため、伝言をお預かりします。ご用件、お名前、お電話番号をお話しください。';
 /** 伝言保存後に流す「承りました」系の完了アナウンス。 */
-const COMPLETION_PROMPT = '\u78ba\u304b\u306b\u627f\u308a\u307e\u3057\u305f\u3002\u62c5\u5f53\u8005\u306b\u5171\u6709\u3044\u305f\u3057\u307e\u3059\u3002';
+const COMPLETION_PROMPT = '確かに承りました。担当者に共有いたします。';
 
 /**
  * サーバー1プロセス内で共有するメモリ状態（PoC 用の簡易ストア）。
@@ -106,7 +111,21 @@ const logLevelSeverityIndex = (level) => {
 
 const pinoLogger = pino({
     level: POC_LOG_LEVEL,
-    name: 'poc-server'
+    name: 'poc-server',
+    formatters: {
+        /**
+         * コンソール一行 JSON の `level` を数値ではなく文字列で出す（既定は 30=info 等で読みにくい）。
+         *
+         * Google スタイル: Pino の formatter 契約に従い、シリアライズ後の level フィールドを返す。
+         *
+         * @param {string} label trace / debug / info / warn / error / fatal
+         * @param {number} _number Pino 内部の数値レベル（互換のため受け取るのみ）
+         * @returns {{ level: string }}
+         */
+        level(label, _number) {
+            return { level: label };
+        }
+    }
 });
 
 /**
@@ -378,13 +397,14 @@ const createSpeechResult = (overrides = {}) => ({
  * @param {string} recognizedText STT 全文
  * @returns {string} 取れなければ空文字
  */
+// TODO: 氏名抽出の語句パターンはハードコード。設定または辞書へ集約予定。
 const extractCustomerName = (recognizedText) => {
-    const direct = recognizedText.match(/(?:\u304a\u5ba2\u69d8\u306e\u6c0f\u540d\u306f|\u6c0f\u540d\u306f|\u540d\u524d\u306f|\u79c1\u306f)([^ \u3001\u3002,]+)(?:\u3067\u3059|\u3068\u7533\u3057\u307e\u3059)?/u);
+    const direct = recognizedText.match(/(?:お客様の氏名は|氏名は|名前は|私は)([^ 、。,]+)(?:です|と申します)?/u);
     if (direct) {
         return direct[1];
     }
 
-    const fallback = recognizedText.match(/([^ \u3001\u3002,]+)(?:\u3067\u3059|\u3068\u7533\u3057\u307e\u3059)/u);
+    const fallback = recognizedText.match(/([^ 、。,]+)(?:です|と申します)/u);
     return fallback ? fallback[1] : '';
 };
 
@@ -545,13 +565,14 @@ const postTeamsMessage = async (config, session, messageText) => {
  * @param {Record<string, unknown>} session
  * @returns {string}
  */
+// TODO: Teams 通知テンプレの見出し・プレースホルダ文言はハードコード。集約予定。
 const buildTeamsMessage = (session) => {
     const lines = [
-        '\u4f50\u85e4\u5b9b\u306e\u4f1d\u8a00',
-        `\u53d7\u4ed8\u6642\u523b: ${session.updatedAt || session.createdAt}`,
-        `\u9867\u5ba2\u540d: ${session.customerName || '\u672a\u53d6\u5f97'}`,
-        `\u96fb\u8a71\u756a\u53f7: ${session.customerPhone || '\u672a\u53d6\u5f97'}`,
-        `\u7528\u4ef6: ${session.requirement || '\u672a\u53d6\u5f97'}`
+        '佐藤宛の伝言',
+        `受付時刻: ${session.updatedAt || session.createdAt}`,
+        `顧客名: ${session.customerName || '未取得'}`,
+        `電話番号: ${session.customerPhone || '未取得'}`,
+        `用件: ${session.requirement || '未取得'}`
     ];
 
     if (session.aiSummary?.summary) {
@@ -765,6 +786,7 @@ const createSession = (event, overrides, employees) => {
  * @param {Record<string, unknown>} [overrides] transcript など上書き
  * @returns {Record<string, unknown>}
  */
+// TODO: 既定の部署名・担当者名はハードコード。ルーティング設定と整合させて集約予定。
 const buildMessagePayload = (session, overrides = {}) => {
     const transcript = overrides.messageTranscript || overrides.transcript || session.rawTranscript;
     return {
@@ -772,8 +794,8 @@ const buildMessagePayload = (session, overrides = {}) => {
         serverCallId: session.serverCallId,
         customerName: session.customerName || extractCustomerName(transcript),
         customerPhone: session.customerPhone || extractPhoneNumber(transcript, session.callerPhone || ''),
-        targetDepartment: session.route.department || '\u55b6\u696d\u90e8',
-        targetPerson: session.route.displayName || '\u4f50\u85e4',
+        targetDepartment: session.route.department || '営業部',
+        targetPerson: session.route.displayName || '佐藤',
         messageText: transcript,
         createdAt: new Date().toISOString()
     };
@@ -954,15 +976,16 @@ const persistAiSummaryForJob = async (config, job) => {
  * @param {string} transcript
  * @returns {Record<string, unknown>}
  */
+// TODO: 要約フォールバックの分類キーワード・nextAction 等はハードコード。集約予定。
 const createAiSummaryFallback = (session, transcript) => ({
     summary: `Customer ${session.customerName || 'unknown'} asked for ${session.route.displayName || 'Sato'}. Requirement: ${session.requirement || transcript}`,
-    category: transcript.includes('\u898b\u7a4d') ? '\u55b6\u696d' : '\u4e00\u822c',
-    nextAction: '\u62c5\u5f53\u8005\u3078\u6298\u308a\u8fd4\u3057\u9023\u7d61',
+    category: transcript.includes('見積') ? '営業' : '一般',
+    nextAction: '担当者へ折り返し連絡',
     customerName: session.customerName || '',
     customerPhone: session.customerPhone || '',
     targetDepartment: session.route.department || '',
     targetPerson: session.route.displayName || '',
-    urgency: transcript.includes('\u81f3\u6025') ? 'high' : 'medium',
+    urgency: transcript.includes('至急') ? 'high' : 'medium',
     confidence: 0.78
 });
 
