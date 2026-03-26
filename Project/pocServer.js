@@ -1,3 +1,19 @@
+/**
+ * @fileoverview PoC 用の受付フローを担う Express ルートと通話状態管理。
+ *
+ * ざっくりした流れ:
+ * 1. 着信 Webhook（`/api/incomingCall`）でセッションを作り、必要なら ACS で応答する。
+ * 2. ACS からのコールバック（`/api/callbacks/callAutomation`）で録音・案内・音声認識・転送を進める。
+ * 3. 録音 Blob や Event Grid（`/api/events/blobCreated`）から Whisper / Chat で要約し Teams に送る。
+ *
+ * データは本番相当でもメモリ内 `state` が主（再起動で消える）。検証用のモック API も同じファイルにある。
+ *
+ * @see {@link registerPocRoutes} 実際に `app` へルートを登録する関数
+ */
+
+// ---------------------------------------------------------------------------
+// 依存モジュール（ファイル操作 / HTTP / ログ / Azure SDK）
+// ---------------------------------------------------------------------------
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -6,20 +22,43 @@ const pino = require('pino');
 const { BlobServiceClient } = require('@azure/storage-blob');
 const { CallAutomationClient } = require('@azure/communication-call-automation');
 
+// ---------------------------------------------------------------------------
+// 定数: データファイルパス・Blob コンテナ名・タイムアウト・リトライ上限
+// （値を変えると動作が変わるので、運用で触る可能性があるものはここに集約）
+// ---------------------------------------------------------------------------
 const EMPLOYEE_CSV_PATH = path.join(__dirname, 'data', 'employees.csv');
 const FAQ_CSV_PATH = path.join(__dirname, 'data', 'faq.csv');
+/** 伝言 JSON を置く Blob コンテナ名（設定と一致させる）。 */
 const MESSAGE_CONTAINER = 'call-messages';
+/** 通話録音をコピー・保存するコンテナ名。 */
 const RECORDING_CONTAINER = 'call-recordings';
+/** OpenAI 要約結果 JSON を置くコンテナ名。 */
 const SUMMARY_CONTAINER = 'openai-results';
+/** Teams 転送がこの時間内に接続しなければタイムアウト扱いにする（ミリ秒）。 */
 const TRANSFER_TIMEOUT_MS = 20000;
+/** 伝言収集で「聞き取れなかった」とき、同じプロンプトを繰り返す最大回数。 */
 const RETRY_PROMPT_LIMIT = 2;
+/** 録音イベントの二重処理防止用キーを、メモリに何件まで覚えておくかの上限。 */
 const PROCESSED_ASYNC_KEY_LIMIT = 500;
+/** テストやフォールバック用の「例の発話」全文（認識が空のときの代替など）。 */
 const DEFAULT_TRANSCRIPT = '\u55b6\u696d\u90e8 \u4f50\u85e4\u3055\u3093\u306b\u3064\u306a\u3044\u3067\u304f\u3060\u3055\u3044\u3002\u7528\u4ef6\u306f\u898b\u7a4d\u306e\u76f8\u8ac7\u3067\u3059\u3002\u6c0f\u540d\u306f\u7530\u4e2d\u3001\u96fb\u8a71\u756a\u53f7\u306f09012345678\u3067\u3059\u3002';
+/** 通話開始直後に流す「用件を話してください」系の案内文。 */
 const GUIDANCE_PROMPT = '\u304a\u4e16\u8a71\u306b\u306a\u3063\u3066\u304a\u308a\u307e\u3059\u3002\u3054\u7528\u4ef6\u3092\u304a\u8a71\u3057\u304f\u3060\u3055\u3044\u3002';
+/** 担当者へ転送を試みる直前に流す「お待ちください」系の案内。 */
 const WAITING_PROMPT = '\u8ee2\u9001\u5148\u3092\u78ba\u8a8d\u3057\u3066\u304a\u308a\u307e\u3059\u3002\u305d\u306e\u307e\u307e\u304a\u5f85\u3061\u304f\u3060\u3055\u3044\u3002';
+/** 担当者不在・転送失敗時に伝言を録音させるためのプロンプト。 */
 const ABSENT_PROMPT = '\u62c5\u5f53\u8005\u304c\u5fdc\u7b54\u3067\u304d\u306a\u3044\u305f\u3081\u3001\u4f1d\u8a00\u3092\u304a\u9810\u304b\u308a\u3057\u307e\u3059\u3002\u3054\u7528\u4ef6\u3001\u304a\u540d\u524d\u3001\u304a\u96fb\u8a71\u756a\u53f7\u3092\u304a\u8a71\u3057\u304f\u3060\u3055\u3044\u3002';
+/** 伝言保存後に流す「承りました」系の完了アナウンス。 */
 const COMPLETION_PROMPT = '\u78ba\u304b\u306b\u627f\u308a\u307e\u3057\u305f\u3002\u62c5\u5f53\u8005\u306b\u5171\u6709\u3044\u305f\u3057\u307e\u3059\u3002';
 
+/**
+ * サーバー1プロセス内で共有するメモリ状態（PoC 用の簡易ストア）。
+ *
+ * - sessions: 通話ごとのセッション（キーは sessionId）
+ * - asyncJobs: Whisper / 要約など非同期ジョブの履歴（直近のみ保持）
+ * - logs: 検証 UI 向けに返すログエントリ（件数上限あり）
+ * - processedAsyncKeys: 同じ録音イベントを二重に処理しないためのキー集合
+ */
 const state = {
     sessions: new Map(),
     asyncJobs: [],
@@ -70,6 +109,12 @@ const pinoLogger = pino({
     name: 'poc-server'
 });
 
+/**
+ * ログや ID 用にほぼ一意な文字列を生成する（PoC 用途で十分なランダム性）。
+ *
+ * @param {string} prefix 先頭に付ける識別子（例: `session`）
+ * @returns {string} `prefix-時刻-乱数` 形式
+ */
 const createId = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 
 /**
@@ -151,6 +196,13 @@ const mockTransferOutcomeLabelForLog = (outcome) => {
     return outcome ? String(outcome) : '未指定';
 };
 
+/**
+ * JSON 文字列をパースし、失敗時は呼び出し側の既定値を返す。
+ *
+ * @param {string} value パース対象
+ * @param {unknown} fallback 失敗時の戻り値
+ * @returns {unknown}
+ */
 const safeJsonParse = (value, fallback) => {
     try {
         return JSON.parse(value);
@@ -159,9 +211,21 @@ const safeJsonParse = (value, fallback) => {
     }
 };
 
+/**
+ * CSV 内の `\uXXXX` 形式を実際の文字に戻す（エディタ互換用）。
+ *
+ * @param {string} value 元文字列
+ * @returns {string}
+ */
 const decodeUnicodeEscapes = (value) =>
     String(value || '').replace(/\\u([0-9a-fA-F]{4})/g, (_, code) => String.fromCharCode(parseInt(code, 16)));
 
+/**
+ * 1 行分の CSV をカンマ分割する（ダブルクォート内のカンマはフィールド内として扱う）。
+ *
+ * @param {string} line CSV の 1 行
+ * @returns {string[]} セルの配列
+ */
 const parseCsvLine = (line) => {
     const values = [];
     let current = '';
@@ -188,6 +252,11 @@ const parseCsvLine = (line) => {
     return values;
 };
 
+/**
+ * `data/employees.csv` から有効な担当者一覧を読み込む。
+ *
+ * @returns {Array<Record<string, unknown>>} `enabled=true` の行のみ（priority 昇順で後続処理で並べ替え）
+ */
 const loadEmployees = () => {
     if (!fs.existsSync(EMPLOYEE_CSV_PATH)) {
         return [];
@@ -213,6 +282,11 @@ const loadEmployees = () => {
     }).filter((item) => item.enabled);
 };
 
+/**
+ * `data/faq.csv` から FAQ 一覧を読み込む。
+ *
+ * @returns {Array<Record<string, unknown>>} keyword / answer が揃った行のみ
+ */
 const loadFaqs = () => {
     if (!fs.existsSync(FAQ_CSV_PATH)) {
         return [];
@@ -236,6 +310,14 @@ const loadFaqs = () => {
     }).filter((item) => item.keyword && item.answer);
 };
 
+/**
+ * Event Grid やモック POST のボディを「イベント配列 + 上書きオプション」に正規化する。
+ *
+ * 配列そのもの・`{ events: [...] }`・単一オブジェクトのいずれでも受け付ける。
+ *
+ * @param {unknown} requestBody リクエスト JSON
+ * @returns {{ events: unknown[], mockOverrides: Record<string, unknown> }}
+ */
 const parseMockEventRequest = (requestBody) => {
     if (Array.isArray(requestBody)) {
         return {
@@ -257,6 +339,13 @@ const parseMockEventRequest = (requestBody) => {
     };
 };
 
+/**
+ * Azure Event Grid の購読検証リクエストなら HTTP 200 で validationCode を返して終了する。
+ *
+ * @param {unknown} requestBody リクエスト JSON
+ * @param {import('express').Response} res Express レスポンス
+ * @returns {boolean} 検証イベントを処理した場合 true（呼び出し側は return する）
+ */
 const handleSubscriptionValidation = (requestBody, res) => {
     const { events } = parseMockEventRequest(requestBody);
     const validationEvent = events.find((event) => (event?.eventType || event?.type) === 'Microsoft.EventGrid.SubscriptionValidationEvent');
@@ -270,6 +359,12 @@ const handleSubscriptionValidation = (requestBody, res) => {
     return true;
 };
 
+/**
+ * モックやテスト用の「音声認識結果」オブジェクトを組み立てる。
+ *
+ * @param {Record<string, unknown>} [overrides] recognizedText など上書き
+ * @returns {{ recognizedText: string, confidence: number, language: string, timestamp: string }}
+ */
 const createSpeechResult = (overrides = {}) => ({
     recognizedText: overrides.recognizedText || DEFAULT_TRANSCRIPT,
     confidence: overrides.confidence ?? 0.92,
@@ -277,6 +372,12 @@ const createSpeechResult = (overrides = {}) => ({
     timestamp: new Date().toISOString()
 });
 
+/**
+ * 認識テキストからお客様の名前らしき部分を正規表現で抜き出す（ルールベース）。
+ *
+ * @param {string} recognizedText STT 全文
+ * @returns {string} 取れなければ空文字
+ */
 const extractCustomerName = (recognizedText) => {
     const direct = recognizedText.match(/(?:\u304a\u5ba2\u69d8\u306e\u6c0f\u540d\u306f|\u6c0f\u540d\u306f|\u540d\u524d\u306f|\u79c1\u306f)([^ \u3001\u3002,]+)(?:\u3067\u3059|\u3068\u7533\u3057\u307e\u3059)?/u);
     if (direct) {
@@ -287,6 +388,13 @@ const extractCustomerName = (recognizedText) => {
     return fallback ? fallback[1] : '';
 };
 
+/**
+ * 認識テキストから数字だけ抜き出して電話番号候補にする。既知の発信番号があれば優先。
+ *
+ * @param {string} recognizedText STT 全文
+ * @param {string} [fallbackPhone] 通話元など別経路の番号
+ * @returns {string} 10 桁未満なら空文字
+ */
 const extractPhoneNumber = (recognizedText, fallbackPhone) => {
     if (fallbackPhone) {
         return fallbackPhone;
@@ -296,6 +404,13 @@ const extractPhoneNumber = (recognizedText, fallbackPhone) => {
     return normalized.length >= 10 ? normalized : '';
 };
 
+/**
+ * 発話に「部署名」と「表示名」の両方が含まれる最初の社員を返す（priority が小さいほど優先）。
+ *
+ * @param {string} recognizedText STT 全文
+ * @param {Array<Record<string, unknown>>} employees loadEmployees の結果
+ * @returns {Record<string, unknown>|null}
+ */
 const findEmployee = (recognizedText, employees) => {
     const sortedEmployees = [...employees].sort((left, right) => left.priority - right.priority);
     return sortedEmployees.find((employee) =>
@@ -303,6 +418,13 @@ const findEmployee = (recognizedText, employees) => {
     ) || null;
 };
 
+/**
+ * 用件テキストから部署名・担当者名を除いた「残り」を用件として使う。
+ *
+ * @param {string} recognizedText STT 全文
+ * @param {Record<string, unknown>|null} employee マッチした社員（無ければ全文トリム）
+ * @returns {string}
+ */
 const extractRequirement = (recognizedText, employee) => {
     if (!employee) {
         return recognizedText.trim();
@@ -314,15 +436,34 @@ const extractRequirement = (recognizedText, employee) => {
         .trim();
 };
 
+/**
+ * 発話に FAQ のキーワードが含まれる最初の 1 件を返す（先頭一致の find）。
+ *
+ * @param {string} recognizedText STT 全文
+ * @param {Array<Record<string, unknown>>} faqs loadFaqs の結果
+ * @returns {Record<string, unknown>|null}
+ */
 const findFaqMatch = (recognizedText, faqs) =>
     faqs.find((faq) => recognizedText.includes(faq.keyword)) || null;
 
+/**
+ * Event Grid / ACS イベントから短い種別名を得る（例: `Microsoft.Communication.IncomingCall` → `IncomingCall`）。
+ *
+ * @param {Record<string, unknown>} event イベントオブジェクト
+ * @returns {string}
+ */
 const normalizeEventType = (event) => {
     const raw = event?.eventType || event?.type || '';
     const parts = String(raw).split('.');
     return parts[parts.length - 1];
 };
 
+/**
+ * 接続文字列があれば Azure Blob クライアントを返す。未設定なら null（Blob 系処理はスキップ）。
+ *
+ * @param {Record<string, unknown>} config アプリ設定
+ * @returns {import('@azure/storage-blob').BlobServiceClient|null}
+ */
 const getStorageClient = (config) => {
     if (!config.storageConnectionString) {
         return null;
@@ -330,12 +471,28 @@ const getStorageClient = (config) => {
     return BlobServiceClient.fromConnectionString(config.storageConnectionString);
 };
 
+/**
+ * コンテナが無ければ作成する（冪等）。
+ *
+ * @param {import('@azure/storage-blob').BlobServiceClient} blobServiceClient
+ * @param {string} containerName
+ * @returns {Promise<import('@azure/storage-blob').ContainerClient>}
+ */
 const ensureContainer = async (blobServiceClient, containerName) => {
     const containerClient = blobServiceClient.getContainerClient(containerName);
     await containerClient.createIfNotExists();
     return containerClient;
 };
 
+/**
+ * オブジェクトを JSON 化して Blob にアップロードする。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {string} containerName
+ * @param {string} blobName
+ * @param {unknown} content シリアライズする値
+ * @returns {Promise<string|null>} 公開 URL またはストレージ未設定時は null
+ */
 const saveJsonToBlob = async (config, containerName, blobName, content) => {
     const blobServiceClient = getStorageClient(config);
     if (!blobServiceClient) {
@@ -353,6 +510,14 @@ const saveJsonToBlob = async (config, containerName, blobName, content) => {
     return blockBlobClient.url;
 };
 
+/**
+ * Incoming Webhook URL が設定されていれば Teams にテキスト投稿する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session セッション（ログ用）
+ * @param {string} messageText 送信本文
+ * @returns {Promise<Record<string, unknown>>} skipped / deliveredAt など
+ */
 const postTeamsMessage = async (config, session, messageText) => {
     if (!config.teamsWebhookUrl) {
         return {
@@ -374,6 +539,12 @@ const postTeamsMessage = async (config, session, messageText) => {
     };
 };
 
+/**
+ * 伝言内容を Teams 通知用のプレーンテキストに整形する。
+ *
+ * @param {Record<string, unknown>} session
+ * @returns {string}
+ */
 const buildTeamsMessage = (session) => {
     const lines = [
         '\u4f50\u85e4\u5b9b\u306e\u4f1d\u8a00',
@@ -390,8 +561,20 @@ const buildTeamsMessage = (session) => {
     return lines.join('\n');
 };
 
+// ---------------------------------------------------------------------------
+// ACS SDK の識別子・応答オブジェクトは循環参照を含むことがあるため、
+// セッションに載せるときはプレーンなコピーだけに絞る（JSON 化・ログで壊れないようにする）。
+// ---------------------------------------------------------------------------
+
 // 2026-03-23: SDKオブジェクトの循環参照でJSON化に失敗するため、必要最小限の値のみを抽出する形に変更。
 // const identifierToPlainObject = (identifier) => safeJsonParse(JSON.stringify(identifier || {}), {});
+
+/**
+ * 通話の From/To 等の identifier を、保存用のただのオブジェクトに変換する。
+ *
+ * @param {Record<string, unknown>|null|undefined} identifier SDK の識別子
+ * @returns {Record<string, string>}
+ */
 const identifierToPlainObject = (identifier) => {
     if (!identifier || typeof identifier !== 'object') {
         return {};
@@ -408,6 +591,13 @@ const identifierToPlainObject = (identifier) => {
 };
 
 // 2026-03-23: answerCallの戻り値を丸ごと保持すると循環参照を含むため、セッション保持用に安全な最小構造へ変換。
+
+/**
+ * `answerCall` の戻り値から、接続 ID など必要なフィールドだけを取り出す。
+ *
+ * @param {Record<string, unknown>|null|undefined} answerResult
+ * @returns {{ callConnectionId: string, serverCallId: string, targets: Record<string, string>[] }}
+ */
 const answerResultToPlainObject = (answerResult) => {
     if (!answerResult || typeof answerResult !== 'object') {
         return {};
@@ -424,11 +614,23 @@ const answerResultToPlainObject = (answerResult) => {
     };
 };
 
+/**
+ * 接続文字列からストレージアカウント名を抜き出す（録音先 URL 組み立て用）。
+ *
+ * @param {string} connectionString
+ * @returns {string}
+ */
 const getStorageAccountNameFromConnectionString = (connectionString) => {
     const match = String(connectionString || '').match(/AccountName=([^;]+)/i);
     return match ? match[1] : '';
 };
 
+/**
+ * 録音ファイルの保存先コンテナ URL を決める（明示設定がなければ接続文字列から推測）。
+ *
+ * @param {Record<string, unknown>} config
+ * @returns {string}
+ */
 const deriveRecordingContainerUrl = (config) => {
     if (config.recordingContainerUrl) {
         return config.recordingContainerUrl;
@@ -438,6 +640,12 @@ const deriveRecordingContainerUrl = (config) => {
     return accountName ? `https://${accountName}.blob.core.windows.net/${RECORDING_CONTAINER}` : '';
 };
 
+/**
+ * SDK が期待する「相手の識別子」形式へ変換する（電話 / Teams / CommunicationUser など）。
+ *
+ * @param {Record<string, unknown>|null|undefined} identifier
+ * @returns {Record<string, unknown>|null}
+ */
 const toCallAutomationIdentifier = (identifier) => {
     if (!identifier) {
         return null;
@@ -466,6 +674,16 @@ const toCallAutomationIdentifier = (identifier) => {
     return identifier;
 };
 
+/**
+ * 着信イベントから新しい通話セッションを生成し `state.sessions` に登録する。
+ *
+ * モック時は認識結果からルート・顧客情報を即埋め、本番は `incoming` のまま ACS 応答待ち。
+ *
+ * @param {Record<string, unknown>} event IncomingCall 相当のイベント
+ * @param {Record<string, unknown>} overrides モック用の上書き（isMock, recognizedText 等）
+ * @param {Array<Record<string, unknown>>} employees
+ * @returns {Record<string, unknown>} セッションオブジェクト
+ */
 const createSession = (event, overrides, employees) => {
     const speech = createSpeechResult(overrides);
     const callerPhone = event?.data?.from?.phoneNumber?.value || '';
@@ -540,6 +758,13 @@ const createSession = (event, overrides, employees) => {
     return session;
 };
 
+/**
+ * Blob に保存する伝言 JSON のペイロードを組み立てる。
+ *
+ * @param {Record<string, unknown>} session
+ * @param {Record<string, unknown>} [overrides] transcript など上書き
+ * @returns {Record<string, unknown>}
+ */
 const buildMessagePayload = (session, overrides = {}) => {
     const transcript = overrides.messageTranscript || overrides.transcript || session.rawTranscript;
     return {
@@ -554,23 +779,51 @@ const buildMessagePayload = (session, overrides = {}) => {
     };
 };
 
+/**
+ * Blob のファイル名に使えない文字を除去し、空白をアンダースコアにする。
+ *
+ * @param {unknown} value
+ * @param {string} [fallback]
+ * @returns {string}
+ */
 const sanitizeBlobFilePart = (value, fallback = 'unknown') =>
     String(value || fallback)
         .replace(/[\\/:*?"<>|]/g, '-')
         .replace(/\s+/g, '_');
 
+/**
+ * 伝言 JSON 用の Blob 名（日時 + sessionId）を生成する。
+ *
+ * @param {Record<string, unknown>} messagePayload
+ * @returns {string}
+ */
 const buildMessageBlobName = (messagePayload) => {
     const createdAtPart = sanitizeBlobFilePart(String(messagePayload.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
     const sessionPart = sanitizeBlobFilePart(messagePayload.sessionId, 'no-session');
     return `${createdAtPart}_${sessionPart}.json`;
 };
 
+/**
+ * AI 要約ジョブ用の Blob 名を生成する。
+ *
+ * @param {Record<string, unknown>|null|undefined} job
+ * @returns {string}
+ */
 const buildSummaryBlobName = (job) => {
     const createdAtPart = sanitizeBlobFilePart(String(job?.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
     const sessionPart = sanitizeBlobFilePart(job?.sessionId, 'no-session');
     return `${createdAtPart}_${sessionPart}.json`;
 };
 
+/**
+ * 録音ファイルを自コンテナにコピーするときの名前（分割録音なら part 番号付き）。
+ *
+ * @param {Record<string, unknown>} session
+ * @param {string} sourceUrl 元 Blob の URL
+ * @param {number} [index] チャンク index
+ * @param {number} [totalCount] チャンク総数
+ * @returns {string}
+ */
 const buildRecordingBlobName = (session, sourceUrl, index = 0, totalCount = 1) => {
     const createdAtPart = sanitizeBlobFilePart(String(session?.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
     const sessionPart = sanitizeBlobFilePart(session?.id, 'no-session');
@@ -580,6 +833,15 @@ const buildRecordingBlobName = (session, sourceUrl, index = 0, totalCount = 1) =
     return `${createdAtPart}_${sessionPart}${chunkSuffix}${extension}`;
 };
 
+/**
+ * ストレージ内の別コンテナへ Blob をダウンロード→再アップロードで複製する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {string} sourceUrl コピー元の絶対 URL
+ * @param {string} targetContainerName 宛先コンテナ
+ * @param {string} targetBlobName 宛先 Blob 名
+ * @returns {Promise<string>} 新しい Blob の URL（失敗・未設定時は空文字）
+ */
 const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targetBlobName) => {
     const blobServiceClient = getStorageClient(config);
     if (!blobServiceClient) {
@@ -623,6 +885,14 @@ const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targe
     return targetBlobClient.url;
 };
 
+/**
+ * ACS が返した録音 URL 群を、自前の `RECORDING_CONTAINER` にまとめてコピーする。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string[]} recordingUrls
+ * @returns {Promise<string[]>} コピー後の URL（失敗分はスキップ）
+ */
 const persistRecordingsForSession = async (config, session, recordingUrls) => {
     if (!session || !Array.isArray(recordingUrls) || recordingUrls.length === 0) {
         return [];
@@ -651,6 +921,13 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
     return renamedUrls;
 };
 
+/**
+ * 非同期ジョブ 1 件分の要約結果を `SUMMARY_CONTAINER` に JSON で保存する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} job
+ * @returns {Promise<string>} Blob URL または空
+ */
 const persistAiSummaryForJob = async (config, job) => {
     if (!job) {
         return '';
@@ -670,6 +947,13 @@ const persistAiSummaryForJob = async (config, job) => {
     return url;
 };
 
+/**
+ * OpenAI が使えない・失敗したときに返す固定フォーマットの要約オブジェクト。
+ *
+ * @param {Record<string, unknown>} session
+ * @param {string} transcript
+ * @returns {Record<string, unknown>}
+ */
 const createAiSummaryFallback = (session, transcript) => ({
     summary: `Customer ${session.customerName || 'unknown'} asked for ${session.route.displayName || 'Sato'}. Requirement: ${session.requirement || transcript}`,
     category: transcript.includes('\u898b\u7a4d') ? '\u55b6\u696d' : '\u4e00\u822c',
@@ -682,6 +966,14 @@ const createAiSummaryFallback = (session, transcript) => ({
     confidence: 0.78
 });
 
+/**
+ * Azure OpenAI Chat Completions で通話内容を構造化 JSON 要約する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} transcript 要約対象テキスト
+ * @returns {Promise<Record<string, unknown>>}
+ */
 const callChatCompletions = async (config, session, transcript) => {
     if (!config.openAiEndpoint || !config.openAiApiKey || !config.openAiDeploymentName) {
         return createAiSummaryFallback(session, transcript);
@@ -719,6 +1011,12 @@ const callChatCompletions = async (config, session, transcript) => {
     return safeJsonParse(content, createAiSummaryFallback(session || { route: {} }, transcript));
 };
 
+/**
+ * Blob の HTTPS URL からコンテナ名と Blob 名（パス）を分解する。
+ *
+ * @param {string} url
+ * @returns {{ containerName: string, blobName: string }}
+ */
 const parseBlobUrl = (url) => {
     const parsed = new URL(url);
     const [, containerName, ...blobParts] = parsed.pathname.split('/');
@@ -728,11 +1026,23 @@ const parseBlobUrl = (url) => {
     };
 };
 
+/**
+ * Event Grid の subject から serverCallId を取り出す（URL エンコードを戻す）。
+ *
+ * @param {string} subject
+ * @returns {string}
+ */
 const getServerCallIdFromSubject = (subject) => {
     const match = String(subject || '').match(/\/serverCallId\/([^/]+)$/);
     return match ? decodeURIComponent(match[1]) : '';
 };
 
+/**
+ * 録音関連イベントから、実ファイルの contentLocation URL の配列を得る。
+ *
+ * @param {Record<string, unknown>} event
+ * @returns {string[]}
+ */
 const getRecordingContentLocations = (event) => {
     const chunks = event?.data?.recordingStorageInfo?.recordingChunks;
     if (Array.isArray(chunks) && chunks.length > 0) {
@@ -744,6 +1054,12 @@ const getRecordingContentLocations = (event) => {
     return singleLocation ? [singleLocation] : [];
 };
 
+/**
+ * 引数のうち最初の「空でない配列」を返す（録音 URL の候補を優先順に試す用途）。
+ *
+ * @param {...unknown} candidates
+ * @returns {unknown[]}
+ */
 const firstNonEmptyArray = (...candidates) => {
     for (const candidate of candidates) {
         if (Array.isArray(candidate) && candidate.length > 0) {
@@ -753,6 +1069,12 @@ const firstNonEmptyArray = (...candidates) => {
     return [];
 };
 
+/**
+ * 同じ録音イベントを二度処理しないようキーを記録する（上限超えたら古いものから削除）。
+ *
+ * @param {string} key
+ * @returns {void}
+ */
 const rememberProcessedAsyncKey = (key) => {
     if (!key || state.processedAsyncKeys.has(key)) {
         return;
@@ -769,6 +1091,14 @@ const rememberProcessedAsyncKey = (key) => {
     }
 };
 
+/**
+ * イベント・セッション・上書きから録音 ID を一貫して取得する。
+ *
+ * @param {Record<string, unknown>|null|undefined} session
+ * @param {Record<string, unknown>} event
+ * @param {Record<string, unknown>} [overrides]
+ * @returns {string}
+ */
 const getRecordingIdentity = (session, event, overrides = {}) =>
     overrides.recordingId ||
     event?.data?.recordingId ||
@@ -776,6 +1106,14 @@ const getRecordingIdentity = (session, event, overrides = {}) =>
     session?.recordingId ||
     '';
 
+/**
+ * 録音 Blob をダウンロードし、Whisper デプロイで文字起こしする（複数 URL は連結）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {string[]} blobUrls
+ * @param {string} [transcriptOverride] 指定時は API を呼ばずそのまま返す
+ * @returns {Promise<string>}
+ */
 const transcribeWithWhisper = async (config, blobUrls, transcriptOverride) => {
     if (transcriptOverride) {
         return transcriptOverride;
@@ -824,6 +1162,17 @@ const transcribeWithWhisper = async (config, blobUrls, transcriptOverride) => {
     return transcripts.join('\n').trim();
 };
 
+/**
+ * 録音イベントをきっかけに Whisper → 要約 → Blob 保存 →（未送信なら）Teams 通知まで行う。
+ *
+ * 同一 `asyncKey` はスキップして二重処理を防ぐ。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>|null} session 紐付け可能なら要約をセッションにも載せる
+ * @param {Record<string, unknown>} blobEvent BlobCreated 等
+ * @param {Record<string, unknown>} [overrides] transcript や sessionId の上書き
+ * @returns {Promise<Record<string, unknown>>}
+ */
 const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
     const blobUrls = firstNonEmptyArray(
         overrides.recordingBlobUrls,
@@ -910,6 +1259,16 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// 転送タイムアウト用タイマー・ACS クライアント・セッション検索
+// ---------------------------------------------------------------------------
+
+/**
+ * 転送待ちの setTimeout をクリアする（重複タイムアウト防止）。
+ *
+ * @param {Record<string, unknown>} session
+ * @returns {void}
+ */
 const clearTransferTimer = (session) => {
     if (session.transfer.timerId) {
         clearTimeout(session.transfer.timerId);
@@ -917,14 +1276,33 @@ const clearTransferTimer = (session) => {
     }
 };
 
+/**
+ * リバースプロキシ（App Service 等）を考慮した公開ベース URL を組み立てる。
+ *
+ * @param {import('express').Request} req
+ * @returns {string}
+ */
 const getBaseUrl = (req) => {
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
     const host = req.headers['x-forwarded-host'] || req.headers.host;
     return `${protocol}://${host}`;
 };
 
+/**
+ * ACS Call Automation 用クライアントを生成する。
+ *
+ * @param {Record<string, unknown>} config
+ * @returns {import('@azure/communication-call-automation').CallAutomationClient}
+ */
 const getCallAutomationClient = (config) => new CallAutomationClient(config.connectionString);
 
+/**
+ * セッションに紐づく `CallConnection` を取得する（ID が無ければ null）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @returns {import('@azure/communication-call-automation').CallConnection|null}
+ */
 const getCallConnection = (config, session) => {
     if (!session.callConnectionId) {
         return null;
@@ -932,9 +1310,21 @@ const getCallConnection = (config, session) => {
     return getCallAutomationClient(config).getCallConnection(session.callConnectionId);
 };
 
+/**
+ * serverCallId でセッションを 1 件探す。
+ *
+ * @param {string} serverCallId
+ * @returns {Record<string, unknown>|undefined}
+ */
 const findSessionByServerCallId = (serverCallId) =>
     Array.from(state.sessions.values()).find((item) => item.serverCallId === serverCallId);
 
+/**
+ * コールバックイベントに含まれる ID（serverCallId / callConnectionId）でセッションを特定する。
+ *
+ * @param {Record<string, unknown>} event
+ * @returns {Record<string, unknown>|undefined}
+ */
 const findSessionForCallbackEvent = (event) => {
     const identifiers = [
         event?.data?.serverCallId,
@@ -947,6 +1337,19 @@ const findSessionForCallbackEvent = (event) => {
     );
 };
 
+// ---------------------------------------------------------------------------
+// 通話メディア: 音声再生・認識・録音・切断
+// ---------------------------------------------------------------------------
+
+/**
+ * 日本語ニューラル音声でテキストを再生する（`operationContext` は後続の PlayCompleted と対応付け）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} text 読み上げ文
+ * @param {string} operationContext SDK に渡す文脈キー
+ * @returns {Promise<void>}
+ */
 const playTextPrompt = async (config, session, text, operationContext) => {
     const callConnection = getCallConnection(config, session);
     if (!callConnection) {
@@ -970,6 +1373,13 @@ const playTextPrompt = async (config, session, text, operationContext) => {
     });
 };
 
+/**
+ * 通話を切断する（接続や API が無い場合は何もしない）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @returns {Promise<void>}
+ */
 const tryHangUpCall = async (config, session) => {
     const callConnection = getCallConnection(config, session);
     if (!callConnection || typeof callConnection.hangUp !== 'function') {
@@ -986,6 +1396,13 @@ const tryHangUpCall = async (config, session) => {
     }
 };
 
+/**
+ * 再生完了などで保留していた「次の一手」（転送実行・FAQ 後処理など）を実行する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @returns {Promise<void>}
+ */
 const applyPendingAction = async (config, session) => {
     const pendingAction = session.pendingAction;
     if (pendingAction) {
@@ -1075,6 +1492,14 @@ const applyPendingAction = async (config, session) => {
     }
 };
 
+/**
+ * 保留アクションに紐づく音声再生が失敗したときのフォールバック（伝言収集や切断へ）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} operationContext
+ * @returns {Promise<void>}
+ */
 const handlePendingActionPlaybackFailure = async (config, session, operationContext) => {
     logEvent('error', 'FAQ:再生失敗', {
         sessionId: session.id,
@@ -1115,6 +1540,15 @@ const handlePendingActionPlaybackFailure = async (config, session, operationCont
     await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
 };
 
+/**
+ * 発信者向けに連続認識を開始する（任意で直前にプロンプトを再生）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} operationContext 認識結果と対応付けるキー
+ * @param {string} [promptText] 認識前に流す案内（省略可）
+ * @returns {Promise<void>}
+ */
 const startRecognize = async (config, session, operationContext, promptText) => {
     const callConnection = getCallConnection(config, session);
     if (!callConnection) {
@@ -1153,6 +1587,13 @@ const startRecognize = async (config, session, operationContext, promptText) => 
     await callMedia.startRecognizing(toCallAutomationIdentifier(session.from), options);
 };
 
+/**
+ * 通話の録音を開始し、コールバック URL で状態通知を受け取る設定にする。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @returns {Promise<void>}
+ */
 const startRecordingForSession = async (config, session) => {
     try {
         const options = {
@@ -1189,6 +1630,14 @@ const startRecordingForSession = async (config, session) => {
     }
 };
 
+/**
+ * 進行中の録音を停止する（二重停止や ID なしはスキップ）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} [reason] ログ用の理由ラベル
+ * @returns {Promise<boolean>} 停止要求を送れたか
+ */
 const stopRecordingForSession = async (config, session, reason = 'manual-stop') => {
     if (!session?.recordingId) {
         logEvent('warn', '録音:停止スキップ', {
@@ -1228,9 +1677,22 @@ const stopRecordingForSession = async (config, session, reason = 'manual-stop') 
     }
 };
 
+/**
+ * Recognize 完了イベントから認識テキストを取り出す（フィールド名の揺れを吸収）。
+ *
+ * @param {Record<string, unknown>} event
+ * @returns {string}
+ */
 const extractRecognizedText = (event) =>
     event?.data?.speechResult?.speech ?? event?.data?.speechResult?.text ?? event?.data?.recognitionResult?.text ?? '';
 
+/**
+ * 転送がタイムアウトしたときにタイマー解除し、伝言収集へ移行する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @returns {Promise<void>}
+ */
 const transferTimeoutHandler = async (config, session) => {
     if (session.transfer.status === 'connected' || session.status === 'message-saved') {
         return;
@@ -1248,6 +1710,13 @@ const transferTimeoutHandler = async (config, session) => {
     await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
 };
 
+/**
+ * 担当者への転送を試みる。実接続が無いモックでは `mockTransferOutcome` で結果をシミュレート。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @returns {Promise<void>}
+ */
 const attemptTransfer = async (config, session) => {
     logEvent('debug', 'フロー:転送試行', {
         sessionId: session.id,
@@ -1303,6 +1772,14 @@ const attemptTransfer = async (config, session) => {
     }
 };
 
+/**
+ * 伝言を Blob に保存し、完了アナウンス→（モックなら即）切断まで進める。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} transcript 伝言として扱うテキスト
+ * @returns {Promise<void>}
+ */
 const finalizeMessageFallback = async (config, session, transcript) => {
     logEvent('debug', 'フロー:伝言確定開始', {
         sessionId: session.id,
@@ -1500,6 +1977,14 @@ const handleRecognizeCompleted = async (config, session, event, employees, faqs)
     await attemptTransfer(config, session);
 };
 
+/**
+ * 音声認識が失敗したときの分岐（伝言モードはリトライ、それ以外は案内へ戻す）。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {Record<string, unknown>} event
+ * @returns {Promise<void>}
+ */
 const handleRecognizeFailed = async (config, session, event) => {
     const operationContext = event?.data?.operationContext || '';
     logEvent('warn', '認識:失敗', {
@@ -1528,6 +2013,15 @@ const handleRecognizeFailed = async (config, session, event) => {
     await startRecognize(config, session, 'collect-routing', GUIDANCE_PROMPT);
 };
 
+/**
+ * 転送承認・失敗の ACS イベントを処理する。
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string, unknown>} session
+ * @param {string} eventType `CallTransferAccepted` または `CallTransferFailed`
+ * @param {Record<string, unknown>} event
+ * @returns {Promise<void>}
+ */
 const handleTransferEvent = async (config, session, eventType, event) => {
     if (eventType === 'CallTransferAccepted') {
         clearTransferTimer(session);
@@ -1555,6 +2049,16 @@ const handleTransferEvent = async (config, session, eventType, event) => {
     }
 };
 
+// ---------------------------------------------------------------------------
+// ローカル検証用: Event Grid 形式に近いモックイベントを組み立てる
+// ---------------------------------------------------------------------------
+
+/**
+ * テスト POST 用の疑似 `Microsoft.Communication.IncomingCall` 配列を返す。
+ *
+ * @param {Record<string, unknown>} [body] from / serverCallId など上書き
+ * @returns {Record<string, unknown>[]}
+ */
 const createMockIncomingCallEvent = (body = {}) => ([
     {
         id: body.id || createId('incoming'),
@@ -1578,6 +2082,12 @@ const createMockIncomingCallEvent = (body = {}) => ([
     }
 ]);
 
+/**
+ * テスト POST 用の疑似 `Microsoft.Storage.BlobCreated` 配列を返す。
+ *
+ * @param {Record<string, unknown>} [body] url / blobName など
+ * @returns {Record<string, unknown>[]}
+ */
 const createMockBlobCreatedEvent = (body = {}) => ([
     {
         id: body.id || createId('blob'),
@@ -1590,15 +2100,26 @@ const createMockBlobCreatedEvent = (body = {}) => ([
     }
 ]);
 
+/**
+ * PoC 関連の HTTP ルートを Express `app` に登録する（本番 Webhook とデバッグ API を含む）。
+ *
+ * @param {import('express').Application} app
+ * @param {Record<string, unknown>} config 接続文字列・OpenAI・Webhook 等
+ * @returns {void}
+ */
 const registerPocRoutes = (app, config) => {
+    // --- 検証 UI・設定確認向け（認証なし想定のため本番ではネットワーク制限推奨）---
+    /** 社員マスタ（転送先）CSV を JSON で返す。 */
     app.get('/api/poc/employees', async (req, res) => {
         res.status(200).json({ employees: loadEmployees() });
     });
 
+    /** FAQ CSV の内容をそのまま JSON で返す。 */
     app.get('/api/poc/faqs', async (req, res) => {
         res.status(200).json({ faqs: loadFaqs() });
     });
 
+    /** メモリ上のセッション・非同期ジョブ・ログなど PoC 全体のスナップショット（デバッグ用）。 */
     app.get('/api/poc/state', async (req, res) => {
         res.status(200).json({
             employees: loadEmployees(),
@@ -1621,6 +2142,7 @@ const registerPocRoutes = (app, config) => {
         });
     });
 
+    /** 着信〜認識〜転送/伝言までを、実 ACS なしでシミュレートする。 */
     app.post('/api/poc/mockIncomingCall', async (req, res) => {
         try {
             const employees = loadEmployees();
@@ -1652,6 +2174,7 @@ const registerPocRoutes = (app, config) => {
         }
     });
 
+    /** 録音 Blob 作成イベントを模し、Whisper/要約パイプラインだけ試す。 */
     app.post('/api/poc/mockBlobCreated', async (req, res) => {
         try {
             const event = createMockBlobCreatedEvent(req.body)[0];
@@ -1664,6 +2187,8 @@ const registerPocRoutes = (app, config) => {
         }
     });
 
+    // --- ACS / Event Grid から呼ばれる本番系エンドポイント ---
+    /** Event Grid または ACS からの着信通知。購入検証・モック・実 answerCall をここで分岐。 */
     app.post('/api/incomingCall', async (req, res) => {
         try {
             if (handleSubscriptionValidation(req.body, res)) {
@@ -1742,6 +2267,7 @@ const registerPocRoutes = (app, config) => {
         }
     });
 
+    /** ACS Call Automation のイベント受け口（接続・認識・再生・転送・録音などすべて）。 */
     app.post('/api/callbacks/callAutomation', async (req, res) => {
         try {
             const { events } = parseMockEventRequest(req.body);
@@ -1753,6 +2279,7 @@ const registerPocRoutes = (app, config) => {
                 eventTypes: events.map((item) => normalizeEventType(item))
             });
 
+            // 1 リクエストに複数イベントが載ることがあるため順に処理する
             for (const event of events) {
                 const eventType = normalizeEventType(event);
                 const session = findSessionForCallbackEvent(event);
@@ -1768,6 +2295,7 @@ const registerPocRoutes = (app, config) => {
                 session.updatedAt = new Date().toISOString();
                 session.lastCallbackEvent = eventType;
 
+                // 通話が確立 → 録音開始 → 案内音声 → 案内終了後に認識開始（pendingAction）
                 if (eventType === 'CallConnected') {
                     session.status = 'connected';
                     // 2026-03-23: Recognize 開始時点での状態を確認するための一時ログ。
@@ -1793,21 +2321,25 @@ const registerPocRoutes = (app, config) => {
                     continue;
                 }
 
+                // 話者の発話が確定（FAQ / 転送 / 伝言の分岐は handleRecognizeCompleted）
                 if (eventType === 'RecognizeCompleted') {
                     await handleRecognizeCompleted(config, session, event, employees, faqs);
                     continue;
                 }
 
+                // ノイズ等で認識失敗 → リトライまたは案内へ戻す
                 if (eventType === 'RecognizeFailed') {
                     await handleRecognizeFailed(config, session, event);
                     continue;
                 }
 
+                // Teams 転送の結果（成功なら人間対応中、失敗なら伝言へ）
                 if (eventType === 'CallTransferAccepted' || eventType === 'CallTransferFailed') {
                     await handleTransferEvent(config, session, eventType, event);
                     continue;
                 }
 
+                // 音声再生が終わったら、保留中の次処理（転送実行・FAQ 後続など）を起動
                 if (eventType === 'PlayCompleted') {
                     const operationContext = event?.data?.operationContext || '';
                     if (operationContext === 'guidance-play') {
@@ -1830,6 +2362,7 @@ const registerPocRoutes = (app, config) => {
                     continue;
                 }
 
+                // 案内や FAQ 回答の再生に失敗したときの救済
                 if (eventType === 'PlayFailed') {
                     const operationContext = event?.data?.operationContext || '';
                     if (operationContext === 'guidance-play') {
@@ -1846,6 +2379,7 @@ const registerPocRoutes = (app, config) => {
                     continue;
                 }
 
+                // 相手が切電
                 if (eventType === 'CallDisconnected') {
                     clearTransferTimer(session);
                     session.status = session.status === 'human-connected' ? 'completed' : session.status;
@@ -1856,6 +2390,7 @@ const registerPocRoutes = (app, config) => {
                     continue;
                 }
 
+                // 録音ファイルがストレージ上で利用可能になった通知 → 自コンテナへコピーして URL をセッションに保持
                 if (eventType === 'RecordingFileStatusUpdated') {
                     const contentLocations = getRecordingContentLocations(event);
                     logEvent('debug', '録音:ステータス更新を受信', {
@@ -1889,6 +2424,7 @@ const registerPocRoutes = (app, config) => {
         }
     });
 
+    /** ストレージの Blob 作成や録音完了を Event Grid 経由で受け、要約ジョブを起動する。 */
     app.post('/api/events/blobCreated', async (req, res) => {
         try {
             if (handleSubscriptionValidation(req.body, res)) {
@@ -1947,6 +2483,7 @@ const registerPocRoutes = (app, config) => {
     });
 };
 
+/** 他モジュールから使うのはルート登録関数のみ（サーバー本体が require する）。 */
 module.exports = {
     registerPocRoutes
 };
