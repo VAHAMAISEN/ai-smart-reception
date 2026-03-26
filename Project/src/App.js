@@ -268,6 +268,7 @@ function App() {
               <article className="log-row" key={`${entry.timestamp}-${index}`}>
                 <div className="session-topline">
                   <strong>{entry.type}</strong>
+                  {entry.level ? <span className="pill">{entry.level}</span> : null}
                   <span>{entry.timestamp}</span>
                 </div>
                 <JsonBlock value={entry.payload} />

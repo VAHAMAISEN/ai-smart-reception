@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const FormData = require('form-data');
+const pino = require('pino');
 const { BlobServiceClient } = require('@azure/storage-blob');
 const { CallAutomationClient } = require('@azure/communication-call-automation');
 
@@ -27,17 +28,127 @@ const state = {
     processedAsyncKeyOrder: []
 };
 
+/**
+ * 運用向け（App Service のアプリケーション設定など）。
+ *
+ * 次の変数はいずれも省略可能で、未設定時は右の既定と同じ動きになる。
+ * 運用でレベルを変えたいときだけ設定すればよい。
+ *
+ * - `POC_LOG_LEVEL` … サーバー標準出力（Pino）に出す最小レベル。既定: `info`
+ * - `POC_LOG_MEMORY_MIN` … `/api/poc/state` 経由で検証 UI に返すメモリログの最小レベル。既定: `info`
+ *
+ * 値は `trace` / `debug` / `info` / `warn` / `error` / `fatal`。
+ * `POC_LOG_MEMORY_MIN` が未知の文字列のときは比較上 `info` と同等扱い。
+ */
+
+/** 重要度が低い順。右に行くほど重大（比較は配列インデックスで行う）。 */
+const LOG_LEVEL_SEVERITY_ORDER = Object.freeze(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+
+/** Pino の最小ログレベル（未設定時は info＝本番向け）。App Service の値の前後空白は無視する。 */
+const POC_LOG_LEVEL = ((process.env.POC_LOG_LEVEL ?? '').trim().toLowerCase() || 'info');
+
+/**
+ * /api/poc/state の logs に載せる最小レベル。
+ * debug は既定で除外し、STT 全文など詳細がブラウザ経由で残らないようにする。
+ */
+const POC_LOG_MEMORY_MIN = ((process.env.POC_LOG_MEMORY_MIN ?? '').trim().toLowerCase() || 'info');
+
+/**
+ * レベル名を「重要度インデックス」に変換する（0=trace … 大きいほど重大）。
+ *
+ * @param {string} level
+ * @returns {number}
+ */
+const logLevelSeverityIndex = (level) => {
+    const key = String(level).toLowerCase();
+    const idx = LOG_LEVEL_SEVERITY_ORDER.indexOf(key);
+    return idx === -1 ? LOG_LEVEL_SEVERITY_ORDER.indexOf('info') : idx;
+};
+
+const pinoLogger = pino({
+    level: POC_LOG_LEVEL,
+    name: 'poc-server'
+});
+
 const createId = (prefix) => `${prefix}-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
 
-const logEvent = (type, payload) => {
+/**
+ * Pino 出力と state.logs の単一入口。コンソールは JSON 一行（Pino 既定）。
+ * payload のキーはログ集約・エンコーディング都合で英語（camelCase）に統一する。
+ *
+ * @param {'trace'|'debug'|'info'|'warn'|'error'|'fatal'} level
+ * @param {string} type イベント種別（画面表示用・日本語可）
+ * @param {Record<string, unknown>} payload 付加フィールド（キーは英語）
+ */
+const logEvent = (level, type, payload) => {
+    const lv = String(level || 'info').toLowerCase();
+    const safeLevel = LOG_LEVEL_SEVERITY_ORDER.includes(lv) ? lv : 'info';
+    const logFn = pinoLogger[safeLevel] ? pinoLogger[safeLevel].bind(pinoLogger) : pinoLogger.info.bind(pinoLogger);
+    logFn({ pocEvent: type, ...payload }, type);
+
+    // メモリ保持は「しきい値未満の詳しさ」は捨てる（例: min=info なら trace/debug は API に載せない）
+    if (logLevelSeverityIndex(safeLevel) < logLevelSeverityIndex(POC_LOG_MEMORY_MIN)) {
+        return;
+    }
+
     const entry = {
+        level: safeLevel,
         type,
         payload,
         timestamp: new Date().toISOString()
     };
     state.logs.unshift(entry);
     state.logs = state.logs.slice(0, 100);
-    console.log(`[poc] ${type}`, payload);
+};
+
+/**
+ * ログ用に文字列を短く切り詰める。
+ *
+ * 認識テキストなど長文がコンソールやメモリ保持ログを圧迫しないようにする。
+ *
+ * @param {string} value 元文字列
+ * @param {number} maxLength 最大文字数
+ * @returns {string}
+ */
+const truncateForLog = (value, maxLength = 120) => {
+    const text = String(value || '');
+    if (text.length <= maxLength) {
+        return text;
+    }
+    return `${text.slice(0, maxLength)}…`;
+};
+
+/**
+ * ログ表示用に保留アクション種別を日本語へ変換する。
+ *
+ * @param {string} type 内部の pendingAction.type
+ * @returns {string}
+ */
+const pendingActionTypeLabelForLog = (type) => {
+    const labels = {
+        'faq-end': 'FAQ終了',
+        'faq-transfer': 'FAQから転送',
+        'transfer-execute': '転送実行',
+        'guidance-recognize': '案内後の認識',
+        'message-complete': '伝言完了'
+    };
+    return labels[type] || String(type || '');
+};
+
+/**
+ * ログ表示用に転送モックの結果を日本語へ変換する。
+ *
+ * @param {string} outcome モックの転送結果
+ * @returns {string}
+ */
+const mockTransferOutcomeLabelForLog = (outcome) => {
+    if (outcome === 'connected') {
+        return '接続';
+    }
+    if (outcome === 'timeout') {
+        return 'タイムアウト';
+    }
+    return outcome ? String(outcome) : '未指定';
 };
 
 const safeJsonParse = (value, fallback) => {
@@ -409,15 +520,22 @@ const createSession = (event, overrides, employees) => {
     };
 
     state.sessions.set(sessionId, session);
-    logEvent('incoming-call.accepted', {
-        sessionId,
+    logEvent('info', '着信:セッション登録', {
+        sessionId: sessionId,
         serverCallId: session.serverCallId
     });
     // App Service ログストリーム等での到達確認用（answer 前に必ず1回／セッション単位）。
-    logEvent('poc.experiment', {
+    logEvent('debug', 'PoC:到達チェック', {
         checkpoint: 'セッションが作成されました',
-        sessionId,
+        sessionId: sessionId,
         serverCallId: session.serverCallId
+    });
+    logEvent('debug', 'フロー:セッション作成', {
+        sessionId: sessionId,
+        serverCallId: session.serverCallId,
+        sessionStatus: session.status,
+        firstRouteFound: session.route.found,
+        isMock: session.isMock
     });
     return session;
 };
@@ -465,20 +583,20 @@ const buildRecordingBlobName = (session, sourceUrl, index = 0, totalCount = 1) =
 const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targetBlobName) => {
     const blobServiceClient = getStorageClient(config);
     if (!blobServiceClient) {
-        logEvent('blob.copy.skipped', {
-            targetContainerName,
-            targetBlobName,
-            reason: 'storage-client-unavailable'
+        logEvent('warn', 'Blob:コピー省略', {
+            targetContainer: targetContainerName,
+            targetBlobName: targetBlobName,
+            reason: 'ストレージクライアント利用不可'
         });
         return '';
     }
 
     const { containerName: sourceContainerName, blobName: sourceBlobName } = parseBlobUrl(sourceUrl);
-    logEvent('blob.copy.started', {
-        sourceContainerName,
-        sourceBlobName,
-        targetContainerName,
-        targetBlobName
+    logEvent('debug', 'Blob:コピー開始', {
+        sourceContainer: sourceContainerName,
+        sourceBlobName: sourceBlobName,
+        targetContainer: targetContainerName,
+        targetBlobName: targetBlobName
     });
     const sourceContainerClient = blobServiceClient.getContainerClient(sourceContainerName);
     const sourceBlobClient = sourceContainerClient.getBlobClient(sourceBlobName);
@@ -495,11 +613,11 @@ const copyBlobToContainer = async (config, sourceUrl, targetContainerName, targe
     const targetBlobClient = targetContainerClient.getBlockBlobClient(targetBlobName);
     const body = Buffer.concat(chunks);
     await targetBlobClient.upload(body, body.byteLength);
-    logEvent('blob.copy.completed', {
-        sourceContainerName,
-        sourceBlobName,
-        targetContainerName,
-        targetBlobName,
+    logEvent('debug', 'Blob:コピー完了', {
+        sourceContainer: sourceContainerName,
+        sourceBlobName: sourceBlobName,
+        targetContainer: targetContainerName,
+        targetBlobName: targetBlobName,
         byteLength: body.byteLength
     });
     return targetBlobClient.url;
@@ -521,11 +639,11 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
                 renamedUrls.push(renamedUrl);
             }
         } catch (error) {
-            logEvent('recording.persist.failed', {
+            logEvent('error', '録音:永続化失敗', {
                 sessionId: session.id,
-                sourceUrl,
-                targetBlobName,
-                message: error.message
+                sourceUrl: sourceUrl,
+                targetBlobName: targetBlobName,
+                errorMessage: error.message
             });
         }
     }
@@ -544,7 +662,7 @@ const persistAiSummaryForJob = async (config, job) => {
         buildSummaryBlobName(job),
         job
     );
-    logEvent('summary.persisted', {
+    logEvent('info', 'AI要約:保存済み', {
         sessionId: job.sessionId,
         jobId: job.id,
         summaryBlobUrl: url
@@ -721,6 +839,10 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
         (blobUrls.length > 0 ? blobUrls.join('|') : `${session?.id || overrides.sessionId || 'unknown'}:${blobEvent?.id || 'no-event'}`);
 
     if (state.processedAsyncKeys.has(asyncKey)) {
+        logEvent('warn', 'フロー:非同期ジョブ重複のためスキップ', {
+            sessionId: session?.id || overrides.sessionId || '',
+            asyncKeyPreview: truncateForLog(asyncKey, 96)
+        });
         return {
             skipped: true,
             reason: 'duplicate-recording-event',
@@ -728,6 +850,12 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
             sessionId: session?.id || overrides.sessionId || ''
         };
     }
+
+    logEvent('debug', 'フロー:非同期ジョブ開始', {
+        sessionId: session?.id || overrides.sessionId || '',
+        blobUrlCount: blobUrls.length,
+        eventType: normalizeEventType(blobEvent) || '不明'
+    });
 
     try {
         const transcript = await transcribeWithWhisper(
@@ -766,17 +894,17 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
             }
         }
 
-        logEvent('async-job.completed', {
+        logEvent('info', '非同期ジョブ:完了', {
             jobId: job.id,
             sessionId: job.sessionId,
             summaryBlobUrl: job.summaryBlobUrl
         });
         return job;
     } catch (error) {
-        logEvent('async-job.failed', {
+        logEvent('error', '非同期ジョブ:失敗', {
             sessionId: session?.id || overrides.sessionId || '',
-            asyncKey,
-            message: error.message
+            asyncKey: asyncKey,
+            errorMessage: error.message
         });
         throw error;
     }
@@ -822,6 +950,11 @@ const findSessionForCallbackEvent = (event) => {
 const playTextPrompt = async (config, session, text, operationContext) => {
     const callConnection = getCallConnection(config, session);
     if (!callConnection) {
+        logEvent('warn', 'フロー:再生スキップ', {
+            sessionId: session.id,
+            operationContext: operationContext,
+            reason: '通話接続なし'
+        });
         return;
     }
 
@@ -846,15 +979,22 @@ const tryHangUpCall = async (config, session) => {
     try {
         await callConnection.hangUp(true);
     } catch (error) {
-        logEvent('call.hangup-failed', {
+        logEvent('warn', '通話:切断失敗', {
             sessionId: session.id,
-            message: error.message
+            errorMessage: error.message
         });
     }
 };
 
 const applyPendingAction = async (config, session) => {
     const pendingAction = session.pendingAction;
+    if (pendingAction) {
+        logEvent('debug', 'フロー:保留アクション実行', {
+            sessionId: session.id,
+            pendingTypeLabel: pendingActionTypeLabelForLog(pendingAction.type),
+            operationContext: pendingAction.operationContext || ''
+        });
+    }
     session.pendingAction = null;
 
     if (!pendingAction) {
@@ -887,9 +1027,9 @@ const applyPendingAction = async (config, session) => {
 
         session.transfer.timerId = setTimeout(() => {
             transferTimeoutHandler(config, session).catch((error) => {
-                logEvent('transfer.timeout-handler.failed', {
+                logEvent('error', '転送:タイムアウト処理失敗', {
                     sessionId: session.id,
-                    message: error.message
+                    errorMessage: error.message
                 });
             });
         }, TRANSFER_TIMEOUT_MS);
@@ -901,7 +1041,7 @@ const applyPendingAction = async (config, session) => {
                 operationContext: session.transfer.operationContext
             });
 
-            logEvent('transfer.requested', {
+            logEvent('info', '転送:要求送信', {
                 sessionId: session.id,
                 teamsUserId: session.route.teamsUserId
             });
@@ -909,9 +1049,9 @@ const applyPendingAction = async (config, session) => {
             clearTransferTimer(session);
             session.transfer.status = 'failed';
             session.status = 'message-required';
-            logEvent('transfer.request-failed', {
+            logEvent('error', '転送:要求失敗', {
                 sessionId: session.id,
-                message: error.message
+                errorMessage: error.message
             });
             await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
         }
@@ -920,7 +1060,7 @@ const applyPendingAction = async (config, session) => {
 
     if (pendingAction.type === 'guidance-recognize') {
         session.updatedAt = new Date().toISOString();
-        logEvent('guidance.recognize.start', {
+        logEvent('debug', '案内:認識開始', {
             sessionId: session.id,
             callConnectionId: session.callConnectionId
         });
@@ -936,9 +1076,9 @@ const applyPendingAction = async (config, session) => {
 };
 
 const handlePendingActionPlaybackFailure = async (config, session, operationContext) => {
-    logEvent('faq.playback-failed', {
+    logEvent('error', 'FAQ:再生失敗', {
         sessionId: session.id,
-        operationContext
+        operationContext: operationContext
     });
 
     const pendingAction = session.pendingAction;
@@ -978,6 +1118,11 @@ const handlePendingActionPlaybackFailure = async (config, session, operationCont
 const startRecognize = async (config, session, operationContext, promptText) => {
     const callConnection = getCallConnection(config, session);
     if (!callConnection) {
+        logEvent('warn', 'フロー:認識開始スキップ', {
+            sessionId: session.id,
+            operationContext: operationContext,
+            reason: '通話接続なし'
+        });
         return;
     }
 
@@ -998,6 +1143,12 @@ const startRecognize = async (config, session, operationContext, promptText) => 
             voiceName: 'ja-JP-NanamiNeural'
         };
     }
+
+    logEvent('debug', 'フロー:音声認識開始', {
+        sessionId: session.id,
+        operationContext: operationContext,
+        hasPlaybackPrompt: Boolean(promptText)
+    });
 
     await callMedia.startRecognizing(toCallAutomationIdentifier(session.from), options);
 };
@@ -1026,32 +1177,32 @@ const startRecordingForSession = async (config, session) => {
         const response = await getCallAutomationClient(config).getCallRecording().start(options);
         session.recordingId = response.recordingId || '';
         session.recordingStopRequested = false;
-        logEvent('recording.started', {
+        logEvent('info', '録音:開始', {
             sessionId: session.id,
             recordingId: session.recordingId
         });
     } catch (error) {
-        logEvent('recording.start-failed', {
+        logEvent('error', '録音:開始失敗', {
             sessionId: session.id,
-            message: error.message
+            errorMessage: error.message
         });
     }
 };
 
 const stopRecordingForSession = async (config, session, reason = 'manual-stop') => {
     if (!session?.recordingId) {
-        logEvent('recording.stop.skipped', {
+        logEvent('warn', '録音:停止スキップ', {
             sessionId: session?.id || '',
-            reason: 'recording-id-missing'
+            reason: '録音IDなし'
         });
         return false;
     }
 
     if (session.recordingStopRequested) {
-        logEvent('recording.stop.skipped', {
+        logEvent('warn', '録音:停止スキップ', {
             sessionId: session.id,
             recordingId: session.recordingId,
-            reason: 'already-requested'
+            reason: '既に停止要求済み'
         });
         return false;
     }
@@ -1059,19 +1210,19 @@ const stopRecordingForSession = async (config, session, reason = 'manual-stop') 
     try {
         session.recordingStopRequested = true;
         await getCallAutomationClient(config).getCallRecording().stop(session.recordingId);
-        logEvent('recording.stop.requested', {
+        logEvent('info', '録音:停止要求', {
             sessionId: session.id,
             recordingId: session.recordingId,
-            reason
+            reason: reason === 'message-saved' ? '伝言保存後' : reason === 'manual-stop' ? '手動停止' : String(reason)
         });
         return true;
     } catch (error) {
         session.recordingStopRequested = false;
-        logEvent('recording.stop.failed', {
+        logEvent('error', '録音:停止失敗', {
             sessionId: session.id,
             recordingId: session.recordingId,
-            reason,
-            message: error.message
+            reason: reason === 'message-saved' ? '伝言保存後' : reason === 'manual-stop' ? '手動停止' : String(reason),
+            errorMessage: error.message
         });
         return false;
     }
@@ -1089,7 +1240,7 @@ const transferTimeoutHandler = async (config, session) => {
     session.transfer.status = 'timeout';
     session.status = 'message-required';
     session.updatedAt = new Date().toISOString();
-    logEvent('transfer.timeout', {
+    logEvent('warn', '転送:タイムアウト', {
         sessionId: session.id,
         teamsUserId: session.transfer.targetTeamsUserId
     });
@@ -1098,7 +1249,14 @@ const transferTimeoutHandler = async (config, session) => {
 };
 
 const attemptTransfer = async (config, session) => {
+    logEvent('debug', 'フロー:転送試行', {
+        sessionId: session.id,
+        hasTeamsUserId: Boolean(session.route.teamsUserId),
+        isMock: session.isMock
+    });
+
     if (!session.route.teamsUserId) {
+        logEvent('warn', 'フロー:転送先なし', { sessionId: session.id });
         session.status = 'message-required';
         await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
         return;
@@ -1107,6 +1265,10 @@ const attemptTransfer = async (config, session) => {
     const callConnection = getCallConnection(config, session);
     if (!callConnection) {
         if (session.isMock) {
+            logEvent('debug', 'フロー:転送（モック分岐）', {
+                sessionId: session.id,
+                mockTransferOutcome: mockTransferOutcomeLabelForLog(session.mockTransferOutcome || 'timeout')
+            });
             if (session.mockTransferOutcome === 'connected') {
                 session.transfer.status = 'connected';
                 session.status = 'human-connected';
@@ -1116,10 +1278,13 @@ const attemptTransfer = async (config, session) => {
                 session.status = 'message-required';
                 await finalizeMessageFallback(config, session, session.rawTranscript || DEFAULT_TRANSCRIPT);
             }
+        } else {
+            logEvent('warn', 'フロー:転送スキップ（接続なし）', { sessionId: session.id });
         }
         return;
     }
 
+    logEvent('debug', 'フロー:転送待ち案内を予約', { sessionId: session.id });
     session.pendingAction = {
         type: 'transfer-execute',
         operationContext: 'wait-for-transfer'
@@ -1127,9 +1292,9 @@ const attemptTransfer = async (config, session) => {
     try {
         await playTextPrompt(config, session, WAITING_PROMPT, 'wait-for-transfer');
     } catch (error) {
-        logEvent('transfer.waiting-prompt.failed', {
+        logEvent('error', '転送:待ち案内失敗', {
             sessionId: session.id,
-            message: error.message
+            errorMessage: error.message
         });
         session.pendingAction = null;
         session.status = 'message-required';
@@ -1139,6 +1304,10 @@ const attemptTransfer = async (config, session) => {
 };
 
 const finalizeMessageFallback = async (config, session, transcript) => {
+    logEvent('debug', 'フロー:伝言確定開始', {
+        sessionId: session.id,
+        transcriptPreview: truncateForLog(transcript || session.rawTranscript || '', 100)
+    });
     clearTransferTimer(session);
     session.rawTranscript = transcript || session.rawTranscript;
     if (!session.customerName) {
@@ -1169,7 +1338,7 @@ const finalizeMessageFallback = async (config, session, transcript) => {
         sessionId: session.id
     };
 
-    logEvent('message.saved', {
+    logEvent('info', '伝言:保存済み', {
         sessionId: session.id,
         messageBlobUrl: session.messageBlobUrl
     });
@@ -1186,9 +1355,9 @@ const finalizeMessageFallback = async (config, session, transcript) => {
             return;
         }
     } catch (error) {
-        logEvent('message.completion-prompt.failed', {
+        logEvent('error', '伝言:完了案内失敗', {
             sessionId: session.id,
-            message: error.message
+            errorMessage: error.message
         });
         session.pendingAction = null;
         await tryHangUpCall(config, session);
@@ -1211,28 +1380,62 @@ const handleRecognizeCompleted = async (config, session, event, employees, faqs)
     const operationContext = event?.data?.operationContext || '';
     const recognizedText = extractRecognizedText(event);
 
+    logEvent('debug', 'フロー:認識完了を処理', {
+        sessionId: session.id,
+        operationContext: operationContext,
+        hasText: Boolean(recognizedText),
+        textPreview: recognizedText ? truncateForLog(recognizedText, 100) : ''
+    });
+
+    if (recognizedText) {
+        logEvent('debug', 'STT:認識全文', {
+            sessionId: session.id,
+            operationContext: operationContext,
+            recognizedText: recognizedText,
+            confidence: event?.data?.speechResult?.confidence ?? null
+        });
+    }
+
     if (!recognizedText) {
         if (operationContext === 'collect-message') {
             session.retryCount += 1;
             if (session.retryCount <= RETRY_PROMPT_LIMIT) {
+                logEvent('debug', 'フロー:認識空欄・伝言を再試行', {
+                    sessionId: session.id,
+                    retryCount: session.retryCount,
+                    retryLimit: RETRY_PROMPT_LIMIT
+                });
                 await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
                 return;
             }
+            logEvent('debug', 'フロー:認識空欄・既定文で伝言確定', { sessionId: session.id });
             await finalizeMessageFallback(config, session, session.rawTranscript || DEFAULT_TRANSCRIPT);
             return;
         }
 
+        logEvent('debug', 'フロー:認識空欄・案内へ戻す', { sessionId: session.id });
         await startRecognize(config, session, 'collect-routing', GUIDANCE_PROMPT);
         return;
     }
 
     if (operationContext === 'collect-message') {
+        logEvent('debug', 'フロー:音声から伝言を取得', {
+            sessionId: session.id,
+            textPreview: truncateForLog(recognizedText, 100)
+        });
         await finalizeMessageFallback(config, session, recognizedText);
         return;
     }
 
     const faq = findFaqMatch(recognizedText, faqs);
     if (faq) {
+        const faqAction = faq.action || 'end';
+        const faqActionLabel = faqAction === 'transfer' ? '転送' : faqAction === 'end' ? '終了' : String(faqAction);
+        logEvent('debug', 'フロー:FAQに一致', {
+            sessionId: session.id,
+            keyword: faq.keyword,
+            action: faqActionLabel
+        });
         session.rawTranscript = recognizedText;
         session.customerName = extractCustomerName(recognizedText);
         session.customerPhone = extractPhoneNumber(recognizedText, session.callerPhone);
@@ -1280,32 +1483,48 @@ const handleRecognizeCompleted = async (config, session, event, employees, faqs)
     session.updatedAt = new Date().toISOString();
 
     if (!employee) {
+        logEvent('debug', 'フロー:担当者が見つからない', {
+            sessionId: session.id,
+            textPreview: truncateForLog(recognizedText, 80)
+        });
         session.status = 'message-required';
         await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
         return;
     }
 
+    logEvent('debug', 'フロー:担当者に一致', {
+        sessionId: session.id,
+        displayName: employee.display_name || '',
+        department: employee.department || ''
+    });
     await attemptTransfer(config, session);
 };
 
 const handleRecognizeFailed = async (config, session, event) => {
     const operationContext = event?.data?.operationContext || '';
-    logEvent('recognize.failed', {
+    logEvent('warn', '認識:失敗', {
         sessionId: session.id,
-        operationContext,
-        reason: event?.data?.resultInformation?.message || 'unknown'
+        operationContext: operationContext,
+        reason: event?.data?.resultInformation?.message || '不明'
     });
 
     if (operationContext === 'collect-message') {
         session.retryCount += 1;
         if (session.retryCount <= RETRY_PROMPT_LIMIT) {
+            logEvent('debug', 'フロー:認識失敗・伝言を再試行', {
+                sessionId: session.id,
+                retryCount: session.retryCount,
+                retryLimit: RETRY_PROMPT_LIMIT
+            });
             await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
             return;
         }
+        logEvent('debug', 'フロー:認識失敗・既定文で伝言確定', { sessionId: session.id });
         await finalizeMessageFallback(config, session, session.rawTranscript || DEFAULT_TRANSCRIPT);
         return;
     }
 
+    logEvent('debug', 'フロー:認識失敗・案内へ戻す', { sessionId: session.id });
     await startRecognize(config, session, 'collect-routing', GUIDANCE_PROMPT);
 };
 
@@ -1315,7 +1534,7 @@ const handleTransferEvent = async (config, session, eventType, event) => {
         session.transfer.status = 'connected';
         session.status = 'human-connected';
         session.updatedAt = new Date().toISOString();
-        logEvent('transfer.connected', {
+        logEvent('info', '転送:接続済み', {
             sessionId: session.id,
             teamsUserId: session.route.teamsUserId
         });
@@ -1327,10 +1546,11 @@ const handleTransferEvent = async (config, session, eventType, event) => {
         session.transfer.status = 'failed';
         session.status = 'message-required';
         session.updatedAt = new Date().toISOString();
-        logEvent('transfer.failed', {
+        logEvent('error', '転送:失敗', {
             sessionId: session.id,
             resultInformation: event?.data?.resultInformation || null
         });
+        logEvent('info', 'フロー:転送失敗から伝言収集へ', { sessionId: session.id });
         await startRecognize(config, session, 'collect-message', ABSENT_PROMPT);
     }
 };
@@ -1486,12 +1706,12 @@ const registerPocRoutes = (app, config) => {
             }
 
             // 2026-03-23: Cognitive Services 設定が call setup に載っているかを切り分けるための確認ログ。
-            logEvent('incoming-call.answer-options', {
+            logEvent('debug', '着信:応答オプション', {
                 sessionId: session.id,
-                hasCognitiveServicesEndpoint: Boolean(config.cognitiveServicesEndpoint),
+                cognitiveEndpointConfigured: Boolean(config.cognitiveServicesEndpoint),
                 cognitiveServicesEndpoint: config.cognitiveServicesEndpoint || '',
                 hasCallIntelligenceOptions: Boolean(answerOptions.callIntelligenceOptions),
-                callbackUri: session.callbackUri
+                callbackUrl: session.callbackUri
             });
 
             const answerResult = await client.answerCall(session.incomingCallContext, session.callbackUri, answerOptions);
@@ -1501,6 +1721,12 @@ const registerPocRoutes = (app, config) => {
             session.serverCallId = session.answerCallResult.serverCallId || session.serverCallId;
             session.status = 'answered';
             session.updatedAt = new Date().toISOString();
+
+            logEvent('info', 'フロー:着信応答完了', {
+                sessionId: session.id,
+                callConnectionId: session.callConnectionId,
+                serverCallId: session.serverCallId
+            });
 
             res.status(202).json({
                 sessionId: session.id,
@@ -1522,10 +1748,20 @@ const registerPocRoutes = (app, config) => {
             const employees = loadEmployees();
             const faqs = loadFaqs();
 
+            logEvent('debug', 'フロー:コールバック受信', {
+                eventCount: events.length,
+                eventTypes: events.map((item) => normalizeEventType(item))
+            });
+
             for (const event of events) {
                 const eventType = normalizeEventType(event);
                 const session = findSessionForCallbackEvent(event);
                 if (!session) {
+                    logEvent('warn', 'フロー:コールバック（セッション未解決）', {
+                        eventType: eventType,
+                        serverCallId: event?.data?.serverCallId || '',
+                        callConnectionId: event?.data?.callConnectionId || event?.callConnectionId || ''
+                    });
                     continue;
                 }
 
@@ -1535,10 +1771,10 @@ const registerPocRoutes = (app, config) => {
                 if (eventType === 'CallConnected') {
                     session.status = 'connected';
                     // 2026-03-23: Recognize 開始時点での状態を確認するための一時ログ。
-                    logEvent('call.connected', {
+                    logEvent('info', '通話:接続済み', {
                         sessionId: session.id,
                         callConnectionId: session.callConnectionId,
-                        hasCognitiveServicesEndpoint: Boolean(config.cognitiveServicesEndpoint),
+                        cognitiveEndpointConfigured: Boolean(config.cognitiveServicesEndpoint),
                         cognitiveServicesEndpoint: config.cognitiveServicesEndpoint || ''
                     });
                     // 2026-03-23: 通話未確立状態での録音開始失敗を避けるため、録音開始は CallConnected 後へ移動。
@@ -1548,7 +1784,7 @@ const registerPocRoutes = (app, config) => {
                         type: 'guidance-recognize',
                         operationContext: 'guidance-play'
                     };
-                    logEvent('guidance.play.requested', {
+                    logEvent('info', '案内:再生要求', {
                         sessionId: session.id,
                         callConnectionId: session.callConnectionId,
                         operationContext: 'guidance-play'
@@ -1575,13 +1811,20 @@ const registerPocRoutes = (app, config) => {
                 if (eventType === 'PlayCompleted') {
                     const operationContext = event?.data?.operationContext || '';
                     if (operationContext === 'guidance-play') {
-                        logEvent('guidance.play.completed', {
+                        logEvent('info', '案内:再生完了', {
                             sessionId: session.id,
                             callConnectionId: session.callConnectionId,
-                            operationContext
+                            operationContext: operationContext
                         });
                     }
                     if (session.pendingAction?.operationContext === operationContext) {
+                        if (operationContext !== 'guidance-play') {
+                            logEvent('debug', 'フロー:再生完了（保留へ）', {
+                                sessionId: session.id,
+                                operationContext: operationContext,
+                                pendingTypeLabel: pendingActionTypeLabelForLog(session.pendingAction.type)
+                            });
+                        }
                         await applyPendingAction(config, session);
                     }
                     continue;
@@ -1590,10 +1833,10 @@ const registerPocRoutes = (app, config) => {
                 if (eventType === 'PlayFailed') {
                     const operationContext = event?.data?.operationContext || '';
                     if (operationContext === 'guidance-play') {
-                        logEvent('guidance.play.failed', {
+                        logEvent('error', '案内:再生失敗', {
                             sessionId: session.id,
                             callConnectionId: session.callConnectionId,
-                            operationContext,
+                            operationContext: operationContext,
                             resultInformation: event?.data?.resultInformation || null
                         });
                     }
@@ -1606,7 +1849,7 @@ const registerPocRoutes = (app, config) => {
                 if (eventType === 'CallDisconnected') {
                     clearTransferTimer(session);
                     session.status = session.status === 'human-connected' ? 'completed' : session.status;
-                    logEvent('call.disconnected', {
+                    logEvent('info', '通話:切断', {
                         sessionId: session.id,
                         callConnectionId: session.callConnectionId
                     });
@@ -1615,7 +1858,7 @@ const registerPocRoutes = (app, config) => {
 
                 if (eventType === 'RecordingFileStatusUpdated') {
                     const contentLocations = getRecordingContentLocations(event);
-                    logEvent('recording.status-updated.received', {
+                    logEvent('debug', '録音:ステータス更新を受信', {
                         sessionId: session.id,
                         recordingId: event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || '',
                         recordingChunkCount: contentLocations.length
@@ -1627,7 +1870,7 @@ const registerPocRoutes = (app, config) => {
                         session.recordingId = event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || session.recordingId;
                         session.recordingStopRequested = true;
                         session.updatedAt = new Date().toISOString();
-                        logEvent('recording.file-ready', {
+                        logEvent('info', '録音:ファイル準備完了', {
                             sessionId: session.id,
                             recordingBlobUrl: session.recordingBlobUrl,
                             recordingChunkCount: contentLocations.length
@@ -1673,7 +1916,7 @@ const registerPocRoutes = (app, config) => {
                 ? getRecordingContentLocations(recordingEvent)
                 : (blobEvent?.data?.url ? [blobEvent.data.url] : []);
 
-            logEvent('blob-created.received', {
+            logEvent('info', 'Blob:作成イベント受信', {
                 sessionId: session?.id || mockOverrides.sessionId || '',
                 eventType: normalizeEventType(selectedEvent),
                 recordingUrlCount: recordingUrls.length

@@ -11,6 +11,7 @@
 .NOTES
     `build.ps1` が作ったタグ一覧から選ぶ形です。Azure CLI とログインが必要です。
     切り替え後に App Service を再起動するため、短い間ダウンタイムが発生します。
+    ログストリームは切断後に自動再接続します（終了は Ctrl+C）。起動が遅いサイトは $LOG_TAIL_WAIT_AFTER_RESTART_SEC を増やしてください。
 #>
 
 # ============================================
@@ -20,6 +21,11 @@ $ACR_NAME       = "pocasracr01"
 $IMAGE_NAME     = "ai-smart-reception"
 $APP_NAME       = "poc-asr-asp01"
 $RESOURCE_GROUP = "ai-smart-reception"
+
+# 再起動直後に log tail するとストリームがすぐ切れて以降ログが出ないことがあるため、先に待機する。
+$LOG_TAIL_WAIT_AFTER_RESTART_SEC = 30
+# ストリーム終了後、再度 az webapp log tail するまでの待ち。
+$LOG_TAIL_RECONNECT_DELAY_SEC = 8
 
 # ============================================
 #  事前チェック
@@ -190,8 +196,17 @@ Write-Host ""
 #  ログ確認
 # ============================================
 Write-Host "----------------------------------------" -ForegroundColor Cyan
-Write-Host "  ログストリーム (Ctrl+C で停止)" -ForegroundColor Cyan
+Write-Host "  ログストリーム" -ForegroundColor Cyan
 Write-Host "----------------------------------------" -ForegroundColor Cyan
+Write-Host "  再起動後 ${LOG_TAIL_WAIT_AFTER_RESTART_SEC} 秒待ってから接続します（起動が遅い場合はスクリプト先頭の変数を増やしてください）。" -ForegroundColor Gray
+Write-Host "  切断後は ${LOG_TAIL_RECONNECT_DELAY_SEC} 秒ごとに自動再接続します。終了は Ctrl+C。" -ForegroundColor Gray
 Write-Host ""
 
-az webapp log tail --name $APP_NAME --resource-group $RESOURCE_GROUP
+Start-Sleep -Seconds $LOG_TAIL_WAIT_AFTER_RESTART_SEC
+
+while ($true) {
+    az webapp log tail --name $APP_NAME --resource-group $RESOURCE_GROUP
+    Write-Host ""
+    Write-Host "[情報] ログストリームが終了しました。${LOG_TAIL_RECONNECT_DELAY_SEC} 秒後に再接続します… (終了は Ctrl+C)" -ForegroundColor Yellow
+    Start-Sleep -Seconds $LOG_TAIL_RECONNECT_DELAY_SEC
+}
