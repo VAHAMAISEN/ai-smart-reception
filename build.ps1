@@ -29,7 +29,7 @@ $FULL_IMAGE = "${IMAGE_NAME}:${TAG}"
 $ACR_IMAGE  = "${ACR_NAME}.azurecr.io/${FULL_IMAGE}"
 
 # 再起動直後に log tail するとストリームがすぐ切れて以降ログが出ないことがあるため、先に待機する。
-$LOG_TAIL_WAIT_AFTER_RESTART_SEC = 30
+$LOG_TAIL_WAIT_AFTER_RESTART_SEC = 50
 # ストリーム終了後、再度 az webapp log tail するまでの待ち（コンテナ起動が遅いと何度か繰り返す）。
 $LOG_TAIL_RECONNECT_DELAY_SEC = 8
 

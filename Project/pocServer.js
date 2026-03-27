@@ -819,6 +819,32 @@ const buildSummaryBlobName = (job) => {
 };
 
 /**
+ * BlobCreated 側で serverCallId が取れない時に、call-messages 相当の保持情報から
+ * もっとも近いセッションを推定する。
+ *
+ * @param {Record<string, unknown>} event
+ * @returns {Record<string, unknown>|undefined}
+ */
+const findSessionByRecentMessage = (event) => {
+    const eventTime = new Date(event?.eventTime || event?.data?.eventTime || Date.now()).getTime();
+    const candidates = Array.from(state.sessions.values())
+        .filter((session) => session?.messageBlobUrl && session?.message?.createdAt)
+        .map((session) => {
+            const messageTime = new Date(session.message.createdAt).getTime();
+            return {
+                session,
+                delta: Number.isFinite(messageTime) ? Math.abs(eventTime - messageTime) : Number.MAX_SAFE_INTEGER
+            };
+        })
+        .filter((item) => Number.isFinite(item.delta))
+        .sort((a, b) => a.delta - b.delta);
+
+    const nearest = candidates[0];
+    return nearest && nearest.delta <= 10 * 60 * 1000 ? nearest.session : undefined;
+};
+
+
+/**
  * 録音ファイルを自コンテナにコピーするときの名前（分割録音なら part 番号付き）。
  *
  * @param {Record<string, unknown>} session
@@ -1206,7 +1232,7 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
 
     if (state.processedAsyncKeys.has(asyncKey)) {
         logEvent('warn', 'フロー:非同期ジョブ重複のためスキップ', {
-            sessionId: session?.id || overrides.sessionId || '',
+            sessionId: session?.id || overrides.sessionId || session?.message?.sessionId || '',
             asyncKeyPreview: truncateForLog(asyncKey, 96)
         });
         return {
@@ -1218,7 +1244,7 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
     }
 
     logEvent('debug', 'フロー:非同期ジョブ開始', {
-        sessionId: session?.id || overrides.sessionId || '',
+        sessionId: session?.id || overrides.sessionId || session?.message?.sessionId || '',
         blobUrlCount: blobUrls.length,
         eventType: normalizeEventType(blobEvent) || '不明'
     });
@@ -1234,7 +1260,7 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
         const job = {
             id: createId('async-job'),
             createdAt: new Date().toISOString(),
-            sessionId: session?.id || overrides.sessionId || '',
+            sessionId: session?.id || overrides.sessionId || session?.message?.sessionId || '',
             blobUrl: blobUrls[0] || '',
             blobUrls,
             transcript: transcript || session?.rawTranscript || '',
@@ -1268,7 +1294,7 @@ const createAsyncJob = async (config, session, blobEvent, overrides = {}) => {
         return job;
     } catch (error) {
         logEvent('error', '非同期ジョブ:失敗', {
-            sessionId: session?.id || overrides.sessionId || '',
+            sessionId: session?.id || overrides.sessionId || session?.message?.sessionId || '',
             asyncKey: asyncKey,
             errorMessage: error.message
         });
@@ -2478,7 +2504,7 @@ const registerPocRoutes = (app, config) => {
                     selectedEvent?.data?.serverCallId ||
                     getServerCallIdFromSubject(selectedEvent?.subject) ||
                     ''
-                );
+                ) || findSessionByRecentMessage(selectedEvent);
 
             const recordingUrls = recordingEvent
                 ? getRecordingContentLocations(recordingEvent)
@@ -2530,4 +2556,5 @@ const registerPocRoutes = (app, config) => {
 module.exports = {
     registerPocRoutes
 };
+
 
