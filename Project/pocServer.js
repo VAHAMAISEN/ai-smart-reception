@@ -814,8 +814,8 @@ const buildMessageBlobName = (messagePayload) => {
  */
 const buildSummaryBlobName = (job) => {
     const createdAtPart = sanitizeBlobFilePart(String(job?.createdAt || '').replace(/[.:]/g, '-'), 'no-createdAt');
-    const sessionPart = sanitizeBlobFilePart(job?.sessionId, 'no-session');
-    return `${createdAtPart}_${sessionPart}.json`;
+    const jobIdPart = sanitizeBlobFilePart(job?.id, 'no-job');
+    return `${createdAtPart}_${jobIdPart}.json`;
 };
 
 /**
@@ -2465,8 +2465,7 @@ const registerPocRoutes = (app, config) => {
                             sessionId: session.id,
                             recordingBlobUrl: session.recordingBlobUrl,
                             recordingChunkCount: contentLocations.length,
-                            artifactCount: artifactLocations.length,
-                            recordingFolderPrefix: buildRecordingFolderPrefix(session)
+                            artifactCount: artifactLocations.length
                         });
                     }
                     continue;
@@ -2531,8 +2530,7 @@ const registerPocRoutes = (app, config) => {
                 logEvent('blob-created.persisted', {
                     sessionId: session.id,
                     recordingBlobUrl: session.recordingBlobUrl,
-                    artifactCount: artifactLocations.length,
-                    recordingFolderPrefix: buildRecordingFolderPrefix(session)
+                    artifactCount: artifactLocations.length
                 });
             }
 
