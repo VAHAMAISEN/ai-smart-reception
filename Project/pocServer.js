@@ -582,20 +582,7 @@ const buildTeamsMessage = (session) => {
     return lines.join('\n');
 };
 
-// ---------------------------------------------------------------------------
-// ACS SDK の識別子・応答オブジェクトは循環参照を含むことがあるため、
-// セッションに載せるときはプレーンなコピーだけに絞る（JSON 化・ログで壊れないようにする）。
-// ---------------------------------------------------------------------------
-
-// 2026-03-23: SDKオブジェクトの循環参照でJSON化に失敗するため、必要最小限の値のみを抽出する形に変更。
-// const identifierToPlainObject = (identifier) => safeJsonParse(JSON.stringify(identifier || {}), {});
-
-/**
- * 通話の From/To 等の identifier を、保存用のただのオブジェクトに変換する。
- *
- * @param {Record<string, unknown>|null|undefined} identifier SDK の識別子
- * @returns {Record<string, string>}
- */
+// 2026-03-23: Avoid circular JSON issues from SDK objects by extracting only minimal fields.
 const identifierToPlainObject = (identifier) => {
     if (!identifier || typeof identifier !== 'object') {
         return {};
@@ -611,14 +598,7 @@ const identifierToPlainObject = (identifier) => {
     };
 };
 
-// 2026-03-23: answerCallの戻り値を丸ごと保持すると循環参照を含むため、セッション保持用に安全な最小構造へ変換。
-
-/**
- * `answerCall` の戻り値から、接続 ID など必要なフィールドだけを取り出す。
- *
- * @param {Record<string, unknown>|null|undefined} answerResult
- * @returns {{ callConnectionId: string, serverCallId: string, targets: Record<string, string>[] }}
- */
+// 2026-03-23: Avoid circular JSON issues from answerCall results by storing only minimal fields.
 const answerResultToPlainObject = (answerResult) => {
     if (!answerResult || typeof answerResult !== 'object') {
         return {};
@@ -646,19 +626,20 @@ const getStorageAccountNameFromConnectionString = (connectionString) => {
     return match ? match[1] : '';
 };
 
-/**
- * 録音ファイルの保存先コンテナ URL を決める（明示設定がなければ接続文字列から推測）。
- *
- * @param {Record<string, unknown>} config
- * @returns {string}
- */
+const getEndpointSuffixFromConnectionString = (connectionString) => {
+    const match = String(connectionString || '').match(/EndpointSuffix=([^;]+)/i);
+    return match ? match[1] : 'core.windows.net';
+};
+
 const deriveRecordingContainerUrl = (config) => {
-    if (config.recordingContainerUrl) {
-        return config.recordingContainerUrl;
+    const configuredUrl = config.recordingContainerUrl || '';
+    if (configuredUrl) {
+        return configuredUrl;
     }
 
     const accountName = getStorageAccountNameFromConnectionString(config.storageConnectionString);
-    return accountName ? `https://${accountName}.blob.core.windows.net/${RECORDING_CONTAINER}` : '';
+    const endpointSuffix = getEndpointSuffixFromConnectionString(config.storageConnectionString);
+    return accountName ? `https://${accountName}.blob.${endpointSuffix}/${RECORDING_CONTAINER}` : '';
 };
 
 /**
@@ -920,15 +901,18 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
         return [];
     }
 
-    const renamedUrls = [];
+    const persistedArtifacts = [];
 
-    for (let index = 0; index < recordingUrls.length; index += 1) {
-        const sourceUrl = recordingUrls[index];
-        const targetBlobName = buildRecordingBlobName(session, sourceUrl, index, recordingUrls.length);
+    for (const sourceUrl of recordingUrls) {
+        const targetBlobName = buildRecordingBlobName(session, sourceUrl);
         try {
             const renamedUrl = await copyBlobToContainer(config, sourceUrl, RECORDING_CONTAINER, targetBlobName);
             if (renamedUrl) {
-                renamedUrls.push(renamedUrl);
+                persistedArtifacts.push({
+                    sourceUrl,
+                    targetUrl: renamedUrl,
+                    targetBlobName
+                });
             }
         } catch (error) {
             logEvent('error', '録音:永続化失敗', {
@@ -940,7 +924,7 @@ const persistRecordingsForSession = async (config, session, recordingUrls) => {
         }
     }
 
-    return renamedUrls;
+    return persistedArtifacts;
 };
 
 /**
@@ -1077,12 +1061,22 @@ const getRecordingContentLocations = (event) => {
     return singleLocation ? [singleLocation] : [];
 };
 
-/**
- * 引数のうち最初の「空でない配列」を返す（録音 URL の候補を優先順に試す用途）。
- *
- * @param {...unknown} candidates
- * @returns {unknown[]}
- */
+const getRecordingArtifactLocations = (event) => {
+    const chunks = event?.data?.recordingStorageInfo?.recordingChunks;
+    if (Array.isArray(chunks) && chunks.length > 0) {
+        return chunks
+            .flatMap((chunk) => [chunk?.contentLocation || '', chunk?.metadataLocation || ''])
+            .filter(Boolean);
+    }
+
+    const urls = [
+        event?.data?.recordingStorageInfo?.contentLocation || event?.data?.contentLocation || '',
+        event?.data?.recordingStorageInfo?.metadataLocation || event?.data?.metadataLocation || ''
+    ].filter(Boolean);
+
+    return urls;
+};
+
 const firstNonEmptyArray = (...candidates) => {
     for (const candidate of candidates) {
         if (Array.isArray(candidate) && candidate.length > 0) {
@@ -1629,6 +1623,10 @@ const startRecordingForSession = async (config, session) => {
             recordingFormat: 'wav',
             recordingStateCallbackEndpointUrl: session.callbackUri
         };
+        const callerRecordingIdentifier = toCallAutomationIdentifier(session.from);
+        if (callerRecordingIdentifier) {
+            options.audioChannelParticipantOrdering = [callerRecordingIdentifier];
+        }
 
         const recordingContainerUrl = deriveRecordingContainerUrl(config);
         if (recordingContainerUrl) {
@@ -1643,7 +1641,11 @@ const startRecordingForSession = async (config, session) => {
         session.recordingStopRequested = false;
         logEvent('info', '録音:開始', {
             sessionId: session.id,
-            recordingId: session.recordingId
+            recordingId: session.recordingId,
+            recordingChannel: options.recordingChannel,
+            recordingFormat: options.recordingFormat,
+            hasAudioChannelParticipantOrdering: Array.isArray(options.audioChannelParticipantOrdering),
+            audioChannelParticipantOrdering: options.audioChannelParticipantOrdering || []
         });
     } catch (error) {
         logEvent('error', '録音:開始失敗', {
@@ -2253,8 +2255,8 @@ const registerPocRoutes = (app, config) => {
                 };
             }
 
-            // 2026-03-23: Cognitive Services 設定が call setup に載っているかを切り分けるための確認ログ。
-            logEvent('debug', '着信:応答オプション', {
+            // 2026-03-23: Confirm Cognitive Services settings are included during call setup.
+            logEvent('debug', '??:???????', {
                 sessionId: session.id,
                 cognitiveEndpointConfigured: Boolean(config.cognitiveServicesEndpoint),
                 cognitiveServicesEndpoint: config.cognitiveServicesEndpoint || '',
@@ -2263,7 +2265,7 @@ const registerPocRoutes = (app, config) => {
             });
 
             const answerResult = await client.answerCall(session.incomingCallContext, session.callbackUri, answerOptions);
-            // 2026-03-23: answerResult全体のJSON化をやめ、必要最小限の値のみ保存する。
+            // 2026-03-23: Store only a minimal, non-circular answerResult shape in session state.
             session.answerCallResult = answerResultToPlainObject(answerResult);
             session.callConnectionId = session.answerCallResult.callConnectionId || '';
             session.serverCallId = session.answerCallResult.serverCallId || session.serverCallId;
@@ -2321,16 +2323,16 @@ const registerPocRoutes = (app, config) => {
                 // 通話が確立 → 録音開始 → 案内音声 → 案内終了後に認識開始（pendingAction）
                 if (eventType === 'CallConnected') {
                     session.status = 'connected';
-                    // 2026-03-23: Recognize 開始時点での状態を確認するための一時ログ。
-                    logEvent('info', '通話:接続済み', {
+                    // 2026-03-23: Capture state when the recognition flow begins.
+                    logEvent('info', '??:????', {
                         sessionId: session.id,
                         callConnectionId: session.callConnectionId,
                         cognitiveEndpointConfigured: Boolean(config.cognitiveServicesEndpoint),
                         cognitiveServicesEndpoint: config.cognitiveServicesEndpoint || ''
                     });
-                    // 2026-03-23: 通話未確立状態での録音開始失敗を避けるため、録音開始は CallConnected 後へ移動。
+                    // 2026-03-23: Start recording only after CallConnected to avoid early-start failures.
                     await startRecordingForSession(config, session);
-                    // 2026-03-23: ガイダンス再生と認識開始を分離し、少なくとも案内は先に流す。
+                    // 2026-03-23: Separate guidance playback from recognize start so the prompt is always played first.
                     session.pendingAction = {
                         type: 'guidance-recognize',
                         operationContext: 'guidance-play'
@@ -2422,7 +2424,12 @@ const registerPocRoutes = (app, config) => {
                         recordingChunkCount: contentLocations.length
                     });
                     if (contentLocations.length > 0) {
-                        const persistedRecordingUrls = await persistRecordingsForSession(config, session, contentLocations);
+                        const artifactLocations = getRecordingArtifactLocations(event);
+                        const persistedArtifacts = await persistRecordingsForSession(config, session, artifactLocations);
+                        const persistedRecordingUrls = contentLocations.map((sourceUrl) => {
+                            const matched = persistedArtifacts.find((item) => item.sourceUrl === sourceUrl);
+                            return matched?.targetUrl || sourceUrl;
+                        });
                         session.recordingBlobUrl = persistedRecordingUrls[0] || contentLocations[0];
                         session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : contentLocations;
                         session.recordingId = event?.data?.recordingId || event?.data?.recordingStorageInfo?.recordingId || session.recordingId;
@@ -2431,7 +2438,9 @@ const registerPocRoutes = (app, config) => {
                         logEvent('info', '録音:ファイル準備完了', {
                             sessionId: session.id,
                             recordingBlobUrl: session.recordingBlobUrl,
-                            recordingChunkCount: contentLocations.length
+                            recordingChunkCount: contentLocations.length,
+                            artifactCount: artifactLocations.length,
+                            recordingFolderPrefix: buildRecordingFolderPrefix(session)
                         });
                     }
                     continue;
@@ -2482,12 +2491,23 @@ const registerPocRoutes = (app, config) => {
             });
 
             if (session && recordingUrls.length > 0) {
-                const persistedRecordingUrls = await persistRecordingsForSession(config, session, recordingUrls);
+                const artifactLocations = getRecordingArtifactLocations(selectedEvent);
+                const persistedArtifacts = await persistRecordingsForSession(config, session, artifactLocations);
+                const persistedRecordingUrls = recordingUrls.map((sourceUrl) => {
+                    const matched = persistedArtifacts.find((item) => item.sourceUrl === sourceUrl);
+                    return matched?.targetUrl || sourceUrl;
+                });
                 session.recordingBlobUrl = persistedRecordingUrls[0] || recordingUrls[0];
                 session.recordingBlobUrls = persistedRecordingUrls.length > 0 ? persistedRecordingUrls : recordingUrls;
                 session.recordingId = getRecordingIdentity(session, selectedEvent, mockOverrides);
                 session.recordingStopRequested = true;
                 session.updatedAt = new Date().toISOString();
+                logEvent('blob-created.persisted', {
+                    sessionId: session.id,
+                    recordingBlobUrl: session.recordingBlobUrl,
+                    artifactCount: artifactLocations.length,
+                    recordingFolderPrefix: buildRecordingFolderPrefix(session)
+                });
             }
 
             const job = await createAsyncJob(config, session, selectedEvent, {
@@ -2510,3 +2530,4 @@ const registerPocRoutes = (app, config) => {
 module.exports = {
     registerPocRoutes
 };
+
